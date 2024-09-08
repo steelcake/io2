@@ -1,0 +1,8 @@
+/target/
+/data/
+.history
+skar.toml
+.vscode
+.env
+.idea
+Cargo.lock
