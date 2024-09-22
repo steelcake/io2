@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-futures = "0.3"
 slab = "0.4.9"
 io-uring = "0.6.4"
 libc = "0.2"
-lazy_static = "1"
 nohash-hasher = "0.2.0"
+pin-project-lite = "0.2"
+log = "0.4"

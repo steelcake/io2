@@ -1,294 +1,289 @@
 use std::ffi::CString;
+use std::future::Future;
 use std::io::{self, ErrorKind};
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use io_uring::opcode;
 use io_uring::types::Fd;
+use pin_project_lite::pin_project;
 
-use crate::runtime::{Context, Future, PollResult};
+use crate::executor::{CURRENT_TASK_CONTEXT, FILES_TO_CLOSE};
 
 pub struct BufferedFile {
     fd: RawFd,
-    statx: libc::statx,
 }
 
-pub enum Close {
-    Dummy,
-    Start(RawFd),
-    CloseFileDescr { io_id: usize },
+pub struct Close {
+    io_id: Option<usize>,
+    fd: RawFd,
 }
 
 impl Future for Close {
     type Output = io::Result<()>;
 
-    fn poll(&mut self, ctx: &mut Context) -> PollResult<Self::Output> {
-        match std::mem::replace(self, Self::Dummy) {
-            Self::Start(fd) => {
-                let io_id = unsafe { ctx.queue_io(opcode::Close::new(Fd(fd)).build()) };
-                *self = Self::CloseFileDescr { io_id };
-                PollResult::Pending
-            }
-            Self::CloseFileDescr { io_id } => {
-                let ready_io = match ctx.take_ready_io(io_id) {
-                    Some(ready_io) => ready_io,
-                    None => {
-                        *self = Self::CloseFileDescr { io_id };
-                        return PollResult::Pending;
-                    }
-                };
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+            let ctx = ctx.as_mut().unwrap();
+            let fut = self.get_mut();
+            match fut.io_id {
+                None => {
+                    fut.io_id =
+                        Some(unsafe { ctx.queue_io(opcode::Close::new(Fd(fut.fd)).build()) });
+                    Poll::Pending
+                }
+                Some(io_id) => {
+                    let io_result = match ctx.take_io_result(io_id) {
+                        Some(io_result) => io_result,
+                        None => {
+                            return Poll::Pending;
+                        }
+                    };
 
-                if ready_io.result < 0 {
-                    PollResult::Ready(Err(io::Error::from_raw_os_error(-ready_io.result)))
-                } else {
-                    PollResult::Ready(Ok(()))
+                    if io_result < 0 {
+                        Poll::Ready(Err(io::Error::from_raw_os_error(-io_result)))
+                    } else {
+                        Poll::Ready(Ok(()))
+                    }
                 }
             }
-            Self::Dummy => unreachable!(),
-        }
+        })
     }
 }
 
-pub enum Open {
-    Dummy,
-    Start {
+pin_project! {
+    pub struct Open {
         path: CString,
-        how: Box<libc::open_how>,
-    },
-    OpenFileDescr {
-        path: CString,
-        how: Box<libc::open_how>,
-        io_id: usize,
-    },
-    Statx {
-        empty_path: CString,
-        fd: RawFd,
-        io_id: usize,
-        statxbuf: Box<libc::statx>,
-    },
-    CloseFileDescr {
-        io_id: usize,
-        error: io::Error,
-    },
+        #[pin] how: libc::open_how,
+        io_id: Option<usize>,
+    }
 }
 
 impl Future for Open {
     type Output = io::Result<BufferedFile>;
 
-    fn poll(&mut self, ctx: &mut Context) -> PollResult<Self::Output> {
-        match std::mem::replace(self, Self::Dummy) {
-            Self::Start { path, how } => {
-                let io_id = unsafe {
-                    ctx.queue_io(
-                        opcode::OpenAt2::new(
-                            Fd(libc::AT_FDCWD),
-                            path.as_ptr(),
-                            how.as_ref() as *const libc::open_how as *const _,
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+            let ctx = ctx.as_mut().unwrap();
+            let fut = self.project();
+            match fut.io_id {
+                None => {
+                    *fut.io_id = Some(unsafe {
+                        ctx.queue_io(
+                            opcode::OpenAt2::new(
+                                Fd(libc::AT_FDCWD),
+                                fut.path.as_ptr(),
+                                &*fut.how as *const libc::open_how as *const _,
+                            )
+                            .build(),
                         )
-                        .build(),
-                    )
-                };
-                *self = Self::OpenFileDescr { path, how, io_id };
-                PollResult::Pending
-            }
-            Self::OpenFileDescr { path, how, io_id } => {
-                let ready_io = match ctx.take_ready_io(io_id) {
-                    Some(ready_io) => ready_io,
-                    None => {
-                        *self = Self::OpenFileDescr { path, how, io_id };
-                        return PollResult::Pending;
-                    }
-                };
-
-                let fd = if ready_io.result < 0 {
-                    return PollResult::Ready(Err(io::Error::from_raw_os_error(-ready_io.result)));
-                } else {
-                    ready_io.result
-                };
-
-                let empty_path = CString::new(Vec::new()).unwrap();
-                let statxbuf = Box::new(unsafe { std::mem::zeroed() });
-
-                let io_id = unsafe {
-                    ctx.queue_io(
-                        opcode::Statx::new(
-                            Fd(fd),
-                            empty_path.as_ptr(),
-                            &*statxbuf as *const libc::statx as *mut _,
-                        )
-                        .flags(libc::AT_EMPTY_PATH)
-                        .build(),
-                    )
-                };
-
-                *self = Self::Statx {
-                    empty_path,
-                    fd,
-                    io_id,
-                    statxbuf,
-                };
-                PollResult::Pending
-            }
-            Self::Statx {
-                empty_path,
-                fd,
-                io_id,
-                statxbuf,
-            } => {
-                let ready_io = match ctx.take_ready_io(io_id) {
-                    Some(ready_io) => ready_io,
-                    None => {
-                        *self = Self::Statx {
-                            empty_path,
-                            fd,
-                            io_id,
-                            statxbuf,
-                        };
-                        return PollResult::Pending;
-                    }
-                };
-
-                if ready_io.result < 0 {
-                    let error = io::Error::from_raw_os_error(-ready_io.result);
-                    let io_id = unsafe { ctx.queue_io(opcode::Close::new(Fd(fd)).build()) };
-                    *self = Self::CloseFileDescr { io_id, error }
+                    });
+                    Poll::Pending
                 }
+                Some(io_id) => {
+                    let io_result = match ctx.take_io_result(*io_id) {
+                        Some(io_result) => io_result,
+                        None => {
+                            return Poll::Pending;
+                        }
+                    };
 
-                PollResult::Ready(Ok(BufferedFile {
-                    fd,
-                    statx: *statxbuf,
-                }))
-            }
-            Self::CloseFileDescr { io_id, error } => {
-                match ctx.take_ready_io(io_id) {
-                    Some(_) => (),
-                    None => {
-                        *self = Self::CloseFileDescr { io_id, error };
-                        return PollResult::Pending;
-                    }
+                    let fd = if io_result < 0 {
+                        return Poll::Ready(Err(io::Error::from_raw_os_error(-io_result)));
+                    } else {
+                        io_result
+                    };
+
+                    Poll::Ready(Ok(BufferedFile { fd }))
                 }
-
-                PollResult::Ready(Err(error))
             }
-            Self::Dummy => unreachable!(),
-        }
+        })
     }
 }
 
-pub enum Read {
-    Dummy,
-    Start {
-        file: *const BufferedFile,
-        offset: u64,
-        out: *mut u8,
-    },
-    Read {
-        io_id: usize,
-    },
+pub struct Read<'file, 'buf> {
+    file: &'file BufferedFile,
+    offset: u64,
+    buf: &'buf mut [u8],
+    io_id: Option<usize>,
 }
 
-impl Future for Read {
+impl<'file, 'buf> Future for Read<'file, 'buf> {
     type Output = io::Result<usize>;
 
-    fn poll(&mut self, ctx: &mut Context) -> PollResult<Self::Output> {
-        match std::mem::replace(self, Self::Dummy) {
-            Self::Start { file, offset, out } => {
-                let io_id = unsafe {
-                    ctx.queue_io(
-                        opcode::Read::new(
-                            Fd(file.fd),
-                            out.as_mut_ptr(),
-                            out.len().try_into().unwrap(),
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+            let ctx = ctx.as_mut().unwrap();
+            let fut = self.get_mut();
+            match fut.io_id {
+                None => {
+                    fut.io_id = Some(unsafe {
+                        ctx.queue_io(
+                            opcode::Read::new(
+                                Fd(fut.file.fd),
+                                fut.buf.as_mut_ptr(),
+                                fut.buf.len().try_into().unwrap(),
+                            )
+                            .offset(fut.offset)
+                            .build(),
                         )
-                        .offset(offset)
-                        .build(),
-                    )
-                };
-                *self = Self::Read { io_id };
-                PollResult::Pending
-            }
-            Self::Read { io_id } => {
-                let ready_io = match ctx.take_ready_io(io_id) {
-                    Some(ready_io) => ready_io,
-                    None => {
-                        *self = Self::Read { io_id };
-                        return PollResult::Pending;
-                    }
-                };
+                    });
+                    Poll::Pending
+                }
+                Some(io_id) => {
+                    let io_result = match ctx.take_io_result(io_id) {
+                        Some(io_result) => io_result,
+                        None => {
+                            return Poll::Pending;
+                        }
+                    };
 
-                if ready_io.result < 0 {
-                    PollResult::Ready(Err(io::Error::from_raw_os_error(-ready_io.result)))
-                } else {
-                    PollResult::Ready(Ok(ready_io.result.try_into().unwrap()))
+                    if io_result < 0 {
+                        Poll::Ready(Err(io::Error::from_raw_os_error(-io_result)))
+                    } else {
+                        Poll::Ready(Ok(io_result.try_into().unwrap()))
+                    }
                 }
             }
-            Self::Dummy => unreachable!(),
-        }
+        })
     }
 }
 
-pub enum ReadExact {
-    Dummy,
-    Read {
-        read: Read,
-        out: *mut u8,
-        to_read: usize,
-        file: *const BufferedFile,
-        offset: u64,
-    },
+pub struct Write<'file, 'buf> {
+    file: &'file BufferedFile,
+    offset: u64,
+    buf: &'buf [u8],
+    io_id: Option<usize>,
 }
 
-impl<'a> Future for ReadExact<'a> {
+impl<'file, 'buf> Future for Write<'file, 'buf> {
+    type Output = io::Result<usize>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+            let ctx = ctx.as_mut().unwrap();
+            let fut = self.get_mut();
+            match fut.io_id {
+                None => {
+                    fut.io_id = Some(unsafe {
+                        ctx.queue_io(
+                            opcode::Write::new(
+                                Fd(fut.file.fd),
+                                fut.buf.as_ptr(),
+                                fut.buf.len().try_into().unwrap(),
+                            )
+                            .offset(fut.offset)
+                            .build(),
+                        )
+                    });
+                    Poll::Pending
+                }
+                Some(io_id) => {
+                    let io_result = match ctx.take_io_result(io_id) {
+                        Some(io_result) => io_result,
+                        None => {
+                            return Poll::Pending;
+                        }
+                    };
+
+                    if io_result < 0 {
+                        Poll::Ready(Err(io::Error::from_raw_os_error(-io_result)))
+                    } else {
+                        Poll::Ready(Ok(io_result.try_into().unwrap()))
+                    }
+                }
+            }
+        })
+    }
+}
+
+pin_project! {
+    struct Statx<'file> {
+        file: &'file BufferedFile,
+        io_id: Option<usize>,
+        #[pin] statx: libc::statx,
+        empty_path: CString,
+    }
+}
+
+impl<'file> Future for Statx<'file> {
+    type Output = io::Result<libc::statx>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+            let ctx = ctx.as_mut().unwrap();
+            let fut = self.project();
+            match fut.io_id {
+                None => {
+                    *fut.io_id = Some(unsafe {
+                        ctx.queue_io(
+                            opcode::Statx::new(
+                                Fd(fut.file.fd),
+                                fut.empty_path.as_ptr(),
+                                &*fut.statx as *const libc::statx as *mut _,
+                            )
+                            .flags(libc::AT_EMPTY_PATH)
+                            .build(),
+                        )
+                    });
+                    Poll::Pending
+                }
+                Some(io_id) => {
+                    let io_result = match ctx.take_io_result(*io_id) {
+                        Some(io_result) => io_result,
+                        None => {
+                            return Poll::Pending;
+                        }
+                    };
+
+                    if io_result < 0 {
+                        Poll::Ready(Err(io::Error::from_raw_os_error(-io_result)))
+                    } else {
+                        Poll::Ready(Ok(*fut.statx))
+                    }
+                }
+            }
+        })
+    }
+}
+
+pub struct SyncAll<'file> {
+    file: &'file BufferedFile,
+    io_id: Option<usize>,
+}
+
+impl<'file> Future for SyncAll<'file> {
     type Output = io::Result<()>;
 
-    fn poll(&mut self, ctx: &mut Context) -> PollResult<Self::Output> {
-        match std::mem::replace(self, Self::Dummy) {
-            Self::Read {
-                mut read,
-                out,
-                to_read,
-                file,
-                offset,
-            } => match read.poll(ctx) {
-                PollResult::Pending => PollResult::Pending,
-                PollResult::Yield => PollResult::Yield,
-                PollResult::Ready(n_read) => {
-                    let n_read = match n_read {
-                        Ok(n_read) => n_read,
-                        Err(e) => return PollResult::Ready(Err(e)),
-                    };
-                    if n_read == to_read {
-                        return PollResult::Ready(Ok(()));
-                    }
-                    assert!(n_read <= to_read);
-
-                    let to_read = to_read - n_read;
-                    let out = unsafe { out.add(n_read) };
-                    let offset = offset + u64::try_from(n_read).unwrap();
-
-                    let mut read = Read::Start {
-                        file,
-                        offset,
-                        out: unsafe { std::slice::from_raw_parts_mut(out, to_read) },
-                    };
-
-                    // Start the internal read operation, should return Pending
-                    assert!(matches!(read.poll(ctx), PollResult::Pending));
-
-                    *self = Self::Read {
-                        out,
-                        to_read,
-                        offset,
-                        file,
-                        read,
-                    };
-
-                    PollResult::Pending
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+            let ctx = ctx.as_mut().unwrap();
+            let fut = self.get_mut();
+            match fut.io_id {
+                None => {
+                    fut.io_id =
+                        Some(unsafe { ctx.queue_io(opcode::Fsync::new(Fd(fut.file.fd)).build()) });
+                    Poll::Pending
                 }
-            },
-            Self::Dummy => unreachable!(),
-        }
+                Some(io_id) => {
+                    let io_result = match ctx.take_io_result(io_id) {
+                        Some(io_result) => io_result,
+                        None => {
+                            return Poll::Pending;
+                        }
+                    };
+
+                    if io_result < 0 {
+                        Poll::Ready(Err(io::Error::from_raw_os_error(-io_result)))
+                    } else {
+                        Poll::Ready(Ok(()))
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -299,43 +294,65 @@ impl BufferedFile {
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
         how.flags = flags as u64;
         how.mode = mode as u64;
-        let how = Box::new(how);
-        Ok(Open::Start { path, how })
+        Ok(Open {
+            path,
+            how,
+            io_id: None,
+        })
     }
 
-    pub fn read<'a>(&'a self, offset: u64, out: &'a mut [u8]) -> Read<'a> {
-        Read::Start {
+    pub fn read<'file, 'buf>(&'file self, buf: &'buf mut [u8], offset: u64) -> Read<'file, 'buf> {
+        Read {
             offset,
-            out,
+            buf,
             file: self,
+            io_id: None,
         }
     }
 
-    pub fn read_exact<'a>(&'a self, offset: u64, out: &'a mut [u8]) -> ReadExact<'a> {
-        ReadExact::Read {
-            out: out.as_mut_ptr(),
-            to_read: out.len(),
-            file: self,
-            read: self.read(offset, out),
+    pub fn write<'file, 'buf>(&'file self, buf: &'buf [u8], offset: u64) -> Write<'file, 'buf> {
+        Write {
             offset,
+            buf,
+            file: self,
+            io_id: None,
+        }
+    }
+
+    pub fn sync_all(&self) -> SyncAll {
+        SyncAll {
+            file: self,
+            io_id: None,
         }
     }
 
     pub fn close(self) -> Close {
         let fd = self.fd;
         std::mem::forget(self);
-        Close::Start(fd)
+        Close { io_id: None, fd }
     }
 
-    pub fn statx(&self) -> libc::statx {
-        self.statx
+    fn statx(&self) -> Statx<'_> {
+        Statx {
+            file: self,
+            io_id: None,
+            statx: unsafe { std::mem::zeroed() },
+            empty_path: CString::new(Vec::new()).unwrap(),
+        }
+    }
+
+    pub async fn file_size(&self) -> io::Result<u64> {
+        let statx = self.statx().await?;
+        Ok(statx.stx_size)
     }
 }
 
 impl Drop for BufferedFile {
     fn drop(&mut self) {
-        let fd = self.fd;
-        unsafe { libc::close(fd) };
+        log::warn!("Closing file with Drop, this is not ideal since the file will be closed in the background. An explicit file.close() is preffered.");
+        FILES_TO_CLOSE.with_borrow_mut(|files| {
+            files.push(self.fd);
+        });
     }
 }
 
@@ -345,39 +362,24 @@ mod tests {
 
     use super::*;
 
-    enum TestFuture<'a> {
-        Open(Open),
-        ReadExact {
-            file: BufferedFile,
-            fut: ReadExact<'a>,
-        },
-        Close(Close),
-        Dummy,
-    }
-
-    impl Future for TestFuture {
-        type Output = ();
-
-        fn poll(&mut self, ctx: &mut Context) -> PollResult<Self::Output> {
-            match self.inner.poll(ctx) {
-                PollResult::Pending => PollResult::Pending,
-                PollResult::Yield => PollResult::Yield,
-                PollResult::Ready(file) => {
-                    let file = file.unwrap();
-                    dbg!((file.fd, file.statx.stx_size));
-                    PollResult::Ready(())
-                }
-            }
-        }
-    }
-
     #[test]
-    fn test_open() {
-        crate::runtime::run(
+    fn smoke_test() {
+        crate::executor::run(
             64,
             Duration::from_millis(50),
-            Box::new(TestOpen {
-                inner: BufferedFile::open(Path::new("../Cargo.toml"), libc::O_RDONLY, 0).unwrap(),
+            Box::pin(async {
+                let file = BufferedFile::open(Path::new("Cargo.toml"), libc::O_RDONLY, 0)
+                    .unwrap()
+                    .await
+                    .unwrap();
+                dbg!(file.fd);
+                let size = file.file_size().await.unwrap();
+                dbg!(size);
+                let mut out = vec![0; size.try_into().unwrap()];
+                let num_read = file.read(&mut out, 0).await.unwrap();
+                dbg!(num_read);
+                file.close().await.unwrap();
+                println!("{}", String::from_utf8(out).unwrap());
             }),
         )
         .unwrap();
