@@ -1,55 +1,69 @@
 use std::{
+    alloc::Allocator,
     cell::RefCell,
     collections::VecDeque,
     future::Future,
     io,
-    os::fd::{FromRawFd, RawFd},
+    os::fd::RawFd,
     pin::Pin,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     time::{Duration, Instant},
 };
 
+use hashbrown::{HashMap, HashSet};
 use io_uring::{cqueue, opcode, squeue, types::Fd, IoUring};
-use nohash_hasher::{BuildNoHashHasher, IntMap};
-use slab::Slab;
+use nohash_hasher::BuildNoHashHasher;
 
-use crate::fs::BufferedFile;
+use crate::slab::Slab;
 
 thread_local! {
     pub static CURRENT_TASK_CONTEXT: RefCell<Option<CurrentTaskContext>> = RefCell::new(None);
     pub static FILES_TO_CLOSE: RefCell<Vec<RawFd>> = RefCell::new(Vec::with_capacity(64));
 }
 
+type DynAllocator = &'static dyn Allocator;
+type IoResults = HashMap<usize, i32, BuildNoHashHasher<usize>, DynAllocator>;
+type BlockDeviceInfos = HashMap<u32, BlockDeviceInfo, BuildNoHashHasher<u32>, DynAllocator>;
+type ToNotify = HashSet<usize, BuildNoHashHasher<usize>, DynAllocator>;
+type Task = Pin<Box<dyn Future<Output = ()>, DynAllocator>>;
+
 pub struct CurrentTaskContext {
     start: Instant,
     task_id: usize,
-    to_spawn: Vec<Task>,
-    io_results: IntMap<usize, i32>,
-    io_queue: VecDeque<squeue::Entry>,
+    to_spawn: *mut Vec<Task, DynAllocator>,
+    io_results: *mut IoResults,
+    io_queue: *mut VecDeque<squeue::Entry, DynAllocator>,
     preempt_duration: Duration,
     yielded: bool,
-    block_devices: IntMap<u32, BlockDevice>,
-    io: Slab<usize>,
+    block_device_infos: *mut BlockDeviceInfos,
+    io: *mut Slab<usize>,
+    alloc: DynAllocator,
 }
 
 impl CurrentTaskContext {
     pub(crate) fn take_io_result(&mut self, io_id: usize) -> Option<i32> {
-        match self.io_results.remove(&io_id) {
-            Some(res) => {
-                self.io.remove(io_id);
-                Some(res)
+        unsafe {
+            match (&mut *self.io_results).remove(&io_id) {
+                Some(res) => {
+                    (&mut *self.io).remove(io_id);
+                    Some(res)
+                }
+                None => None,
             }
-            None => None,
         }
     }
 
-    pub(crate) fn get_block_device(&self, major: u32) -> Option<BlockDevice> {
-        self.block_devices.get(&major).copied()
+    pub(crate) fn get_block_device_info(&self, major: u32) -> Option<BlockDeviceInfo> {
+        unsafe { (&*self.block_device_infos).get(&major).copied() }
     }
 
-    pub(crate) fn set_block_device(&mut self, major: u32, block_device: BlockDevice) {
-        if let Some(existing_device) = self.block_devices.insert(major, block_device) {
-            assert_eq!(existing_device, block_device);
+    pub(crate) fn set_block_device_info(&mut self, major: u32, block_device: BlockDeviceInfo) {
+        unsafe {
+            if let Some(existing_device) =
+                (&mut *self.block_device_infos).insert(major, block_device)
+            {
+                assert_eq!(existing_device, block_device);
+            }
         }
     }
 
@@ -57,21 +71,70 @@ impl CurrentTaskContext {
         self.start.elapsed() >= self.preempt_duration
     }
 
-    pub fn spawn(&mut self, task: Task) {
-        self.to_spawn.push(task);
+    pub fn spawn<F: Future<Output = ()> + 'static>(&mut self, future: F) {
+        unsafe {
+            (&mut *self.to_spawn).push(Box::pin_in(future, self.alloc));
+        }
     }
 
+    /// Task will be pinned until the entry is completely processed by io_uring.
+    /// So it is safe to include pinned pointers to self when building the squeue entry.
     pub(crate) unsafe fn queue_io(&mut self, entry: squeue::Entry) -> usize {
-        let io_id = self.io.insert(self.task_id);
-        let entry = entry.user_data(io_id.try_into().unwrap());
-        self.io_queue.push_back(entry);
-        io_id
+        unsafe {
+            let io_id = (&mut *self.io).insert(self.task_id);
+            let entry = entry.user_data(io_id.try_into().unwrap());
+            (&mut *self.io_queue).push_back(entry);
+            io_id
+        }
     }
 }
 
-type Task = Pin<Box<dyn Future<Output = ()>>>;
+pub struct ExecutorConfig {
+    alloc: DynAllocator,
+    ring_depth: u32,
+    preempt_duration: Duration,
+}
 
-pub fn run(ring_depth: u32, preempt_duration: Duration, task: Task) -> io::Result<()> {
+impl ExecutorConfig {
+    pub fn new() -> Self {
+        Self {
+            alloc: &std::alloc::Global,
+            ring_depth: 64,
+            preempt_duration: Duration::from_millis(100),
+        }
+    }
+
+    pub fn alloc(mut self, alloc: DynAllocator) -> Self {
+        self.alloc = alloc;
+        self
+    }
+
+    pub fn ring_depth(mut self, ring_depth: u32) -> Self {
+        self.ring_depth = ring_depth;
+        self
+    }
+
+    pub fn preempt_duration(mut self, preempt_duration: Duration) -> Self {
+        self.preempt_duration = preempt_duration;
+        self
+    }
+
+    pub fn run<F: Future<Output = ()> + 'static>(self, future: F) -> io::Result<()> {
+        run(
+            self.alloc,
+            self.ring_depth,
+            self.preempt_duration,
+            Box::pin_in(future, self.alloc),
+        )
+    }
+}
+
+fn run(
+    alloc: DynAllocator,
+    ring_depth: u32,
+    preempt_duration: Duration,
+    task: Task,
+) -> io::Result<()> {
     let waker = noop_waker();
     let mut poll_ctx = Context::from_waker(&waker);
 
@@ -81,19 +144,23 @@ pub fn run(ring_depth: u32, preempt_duration: Duration, task: Task) -> io::Resul
         .build(ring_depth)?;
     let (submitter, mut sq, mut cq) = ring.split();
 
-    let mut tasks = Slab::<Task>::with_capacity(128);
-    let mut io = Slab::<usize>::with_capacity(128);
-    let mut yielded_tasks = Vec::<usize>::with_capacity(128);
-    let mut io_queue = VecDeque::<squeue::Entry>::with_capacity(128);
-    let mut block_devices =
-        IntMap::<u32, BlockDevice>::with_capacity_and_hasher(16, BuildNoHashHasher::default());
-    let mut to_spawn = Vec::<Task>::with_capacity(128);
-    let mut io_results = IntMap::<usize, i32>::with_capacity_and_hasher(
-        usize::try_from(ring_depth).unwrap() * 3,
+    let mut tasks = Slab::<Task>::with_capacity_in(128, alloc);
+    let mut io = Slab::<usize>::with_capacity_in(128, alloc);
+    let mut yielded_tasks = Vec::<usize, DynAllocator>::with_capacity_in(16, alloc);
+    let mut tasks_to_yield = Vec::<usize, DynAllocator>::with_capacity_in(16, alloc);
+    let mut io_queue = VecDeque::<squeue::Entry, DynAllocator>::with_capacity_in(128, alloc);
+    let mut block_device_infos =
+        BlockDeviceInfos::with_capacity_and_hasher_in(16, BuildNoHashHasher::default(), alloc);
+    let mut to_spawn = Vec::<Task, DynAllocator>::with_capacity_in(128, alloc);
+    let mut io_results = IoResults::with_capacity_and_hasher_in(
+        usize::try_from(ring_depth).unwrap() * 4,
         BuildNoHashHasher::default(),
+        alloc,
     );
+    let mut to_notify =
+        ToNotify::with_capacity_and_hasher_in(128, BuildNoHashHasher::default(), alloc);
 
-    let close_file_task_id = tasks.insert(Box::pin(async {}));
+    let close_file_task_id = tasks.insert(Box::pin_in(async {}, alloc));
     let close_file_io_id = io.insert(close_file_task_id);
 
     let task_id = tasks.insert(task);
@@ -101,33 +168,30 @@ pub fn run(ring_depth: u32, preempt_duration: Duration, task: Task) -> io::Resul
 
     while tasks.len() > 1 {
         // poll yielded tasks
-        for task_id in std::mem::take(&mut yielded_tasks) {
+        for &task_id in yielded_tasks.iter() {
             CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                 *ctx = Some(CurrentTaskContext {
                     start: Instant::now(),
                     task_id,
-                    to_spawn: std::mem::take(&mut to_spawn),
-                    io_results: Default::default(),
-                    io_queue: std::mem::take(&mut io_queue),
+                    to_spawn: &mut to_spawn,
+                    io_results: &mut io_results,
+                    io_queue: &mut io_queue,
                     preempt_duration,
                     yielded: false,
-                    block_devices: std::mem::take(&mut block_devices),
-                    io: std::mem::take(&mut io),
+                    block_device_infos: &mut block_device_infos,
+                    io: &mut io,
+                    alloc,
                 });
             });
             let poll_result = tasks.get_mut(task_id).unwrap().as_mut().poll(&mut poll_ctx);
             let yielded = CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                 let ctx = ctx.take().unwrap();
-                to_spawn = ctx.to_spawn;
-                io_queue = ctx.io_queue;
-                block_devices = ctx.block_devices;
-                io = ctx.io;
                 ctx.yielded
             });
             match poll_result {
                 Poll::Pending => {
                     if yielded {
-                        yielded_tasks.push(task_id);
+                        tasks_to_yield.push(task_id);
                     }
                 }
                 Poll::Ready(_) => {
@@ -135,6 +199,8 @@ pub fn run(ring_depth: u32, preempt_duration: Duration, task: Task) -> io::Resul
                 }
             }
         }
+        yielded_tasks.clear();
+        std::mem::swap(&mut yielded_tasks, &mut tasks_to_yield);
 
         sq.sync();
         if !sq.is_empty() {
@@ -174,7 +240,6 @@ pub fn run(ring_depth: u32, preempt_duration: Duration, task: Task) -> io::Resul
             }
         }
 
-        // poll tasks with finished io
         cq.sync();
         for cqe in &mut cq {
             let io_id = usize::try_from(cqe.user_data()).unwrap();
@@ -183,28 +248,28 @@ pub fn run(ring_depth: u32, preempt_duration: Duration, task: Task) -> io::Resul
             }
             let task_id = *io.get(io_id).unwrap();
             io_results.insert(io_id, cqe.result());
+            to_notify.insert(task_id);
+        }
 
+        // poll tasks with finished io
+        for &task_id in to_notify.iter() {
             CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                 *ctx = Some(CurrentTaskContext {
                     start: Instant::now(),
                     task_id,
-                    to_spawn: std::mem::take(&mut to_spawn),
-                    io_results: std::mem::take(&mut io_results),
-                    io_queue: std::mem::take(&mut io_queue),
+                    to_spawn: &mut to_spawn,
+                    io_results: &mut io_results,
+                    io_queue: &mut io_queue,
                     preempt_duration,
                     yielded: false,
-                    block_devices: std::mem::take(&mut block_devices),
-                    io: std::mem::take(&mut io),
+                    block_device_infos: &mut block_device_infos,
+                    io: &mut io,
+                    alloc,
                 });
             });
             let poll_result = tasks.get_mut(task_id).unwrap().as_mut().poll(&mut poll_ctx);
             let yielded = CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                 let ctx = ctx.take().unwrap();
-                to_spawn = ctx.to_spawn;
-                io_queue = ctx.io_queue;
-                io_results = ctx.io_results;
-                block_devices = ctx.block_devices;
-                io = ctx.io;
                 ctx.yielded
             });
             match poll_result {
@@ -218,6 +283,7 @@ pub fn run(ring_depth: u32, preempt_duration: Duration, task: Task) -> io::Resul
                 }
             }
         }
+        to_notify.clear();
 
         // spawn tasks
         while let Some(task) = to_spawn.pop() {
@@ -228,7 +294,11 @@ pub fn run(ring_depth: u32, preempt_duration: Duration, task: Task) -> io::Resul
         // close files
         FILES_TO_CLOSE.with_borrow_mut(|files| {
             while let Some(fd) = files.pop() {
-                io_queue.push_back(opcode::Close::new(Fd(fd)).build().user_data(close_file_io_id.try_into().unwrap()));
+                io_queue.push_back(
+                    opcode::Close::new(Fd(fd))
+                        .build()
+                        .user_data(close_file_io_id.try_into().unwrap()),
+                );
             }
         });
     }
@@ -237,7 +307,7 @@ pub fn run(ring_depth: u32, preempt_duration: Duration, task: Task) -> io::Resul
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub struct BlockDevice {
+pub struct BlockDeviceInfo {
     pub logical_block_size: usize,
     pub max_sectors_size: usize,
     pub max_segment_size: usize,

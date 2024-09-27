@@ -11,7 +11,7 @@ use io_uring::opcode;
 use io_uring::types::Fd;
 use pin_project_lite::pin_project;
 
-use crate::executor::{CURRENT_TASK_CONTEXT, FILES_TO_CLOSE};
+use crate::executor::{BlockDeviceInfo, CURRENT_TASK_CONTEXT, FILES_TO_CLOSE};
 
 pub struct BufferedFile {
     fd: RawFd,
@@ -345,11 +345,22 @@ impl BufferedFile {
         let statx = self.statx().await?;
         Ok(statx.stx_size)
     }
+
+    pub async fn get_block_device_info(&self) -> io::Result<BlockDeviceInfo> {
+        let statx = self.statx().await?;
+        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+            let ctx = ctx.as_mut().unwrap();
+            if let Some(info) = ctx.get_block_device_info(statx.stx_dev_major) {
+                return Ok(info);
+            }
+
+            todo!()
+        })
+    }
 }
 
 impl Drop for BufferedFile {
     fn drop(&mut self) {
-        log::warn!("Closing file with Drop, this is not ideal since the file will be closed in the background. An explicit file.close() is preffered.");
         FILES_TO_CLOSE.with_borrow_mut(|files| {
             files.push(self.fd);
         });
@@ -358,16 +369,14 @@ impl Drop for BufferedFile {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use crate::executor::ExecutorConfig;
 
     use super::*;
 
     #[test]
     fn smoke_test() {
-        crate::executor::run(
-            64,
-            Duration::from_millis(50),
-            Box::pin(async {
+        ExecutorConfig::new()
+            .run(Box::pin(async {
                 let file = BufferedFile::open(Path::new("Cargo.toml"), libc::O_RDONLY, 0)
                     .unwrap()
                     .await
@@ -380,8 +389,7 @@ mod tests {
                 dbg!(num_read);
                 file.close().await.unwrap();
                 println!("{}", String::from_utf8(out).unwrap());
-            }),
-        )
-        .unwrap();
+            }))
+            .unwrap();
     }
 }
