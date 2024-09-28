@@ -17,7 +17,7 @@ use nohash_hasher::BuildNoHashHasher;
 use crate::slab::Slab;
 
 thread_local! {
-    pub static CURRENT_TASK_CONTEXT: RefCell<Option<CurrentTaskContext>> = RefCell::new(None);
+    pub static CURRENT_TASK_CONTEXT: RefCell<Option<CurrentTaskContext>> = const { RefCell::new(None) };
     pub static FILES_TO_CLOSE: RefCell<Vec<RawFd>> = RefCell::new(Vec::with_capacity(64));
 }
 
@@ -43,9 +43,9 @@ pub struct CurrentTaskContext {
 impl CurrentTaskContext {
     pub(crate) fn take_io_result(&mut self, io_id: usize) -> Option<i32> {
         unsafe {
-            match (&mut *self.io_results).remove(&io_id) {
+            match (*self.io_results).remove(&io_id) {
                 Some(res) => {
-                    (&mut *self.io).remove(io_id);
+                    (*self.io).remove(io_id);
                     Some(res)
                 }
                 None => None,
@@ -54,14 +54,12 @@ impl CurrentTaskContext {
     }
 
     pub(crate) fn get_block_device_info(&self, major: u32) -> Option<BlockDeviceInfo> {
-        unsafe { (&*self.block_device_infos).get(&major).copied() }
+        unsafe { (*self.block_device_infos).get(&major).copied() }
     }
 
     pub(crate) fn set_block_device_info(&mut self, major: u32, block_device: BlockDeviceInfo) {
         unsafe {
-            if let Some(existing_device) =
-                (&mut *self.block_device_infos).insert(major, block_device)
-            {
+            if let Some(existing_device) = (*self.block_device_infos).insert(major, block_device) {
                 assert_eq!(existing_device, block_device);
             }
         }
@@ -73,17 +71,21 @@ impl CurrentTaskContext {
 
     pub fn spawn<F: Future<Output = ()> + 'static>(&mut self, future: F) {
         unsafe {
-            (&mut *self.to_spawn).push(Box::pin_in(future, self.alloc));
+            (*self.to_spawn).push(Box::pin_in(future, self.alloc));
         }
     }
 
     /// Task will be pinned until the entry is completely processed by io_uring.
     /// So it is safe to include pinned pointers to self when building the squeue entry.
+    ///
+    /// Safety: caller must make sure the squeue entry is valid.
+    /// Caller future that queued this IO should not return Poll::Ready until it receives
+    /// io completion via take_io_result
     pub(crate) unsafe fn queue_io(&mut self, entry: squeue::Entry) -> usize {
         unsafe {
-            let io_id = (&mut *self.io).insert(self.task_id);
+            let io_id = (*self.io).insert(self.task_id);
             let entry = entry.user_data(io_id.try_into().unwrap());
-            (&mut *self.io_queue).push_back(entry);
+            (*self.io_queue).push_back(entry);
             io_id
         }
     }
@@ -93,6 +95,12 @@ pub struct ExecutorConfig {
     alloc: DynAllocator,
     ring_depth: u32,
     preempt_duration: Duration,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExecutorConfig {
@@ -141,6 +149,7 @@ fn run(
     let mut ring: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder()
         .setup_single_issuer()
         .setup_submit_all()
+        .setup_coop_taskrun()
         .build(ring_depth)?;
     let (submitter, mut sq, mut cq) = ring.split();
 
@@ -162,11 +171,12 @@ fn run(
 
     let close_file_task_id = tasks.insert(Box::pin_in(async {}, alloc));
     let close_file_io_id = io.insert(close_file_task_id);
+    let mut files_closing = 0usize;
 
     let task_id = tasks.insert(task);
     yielded_tasks.push(task_id);
 
-    while tasks.len() > 1 {
+    while tasks.len() > 1 || files_closing > 0 || FILES_TO_CLOSE.with_borrow(|x| !x.is_empty()) {
         // poll yielded tasks
         for &task_id in yielded_tasks.iter() {
             CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
@@ -195,7 +205,7 @@ fn run(
                     }
                 }
                 Poll::Ready(_) => {
-                    let _ = tasks.remove(task_id);
+                    std::mem::drop(tasks.remove(task_id));
                 }
             }
         }
@@ -244,6 +254,7 @@ fn run(
         for cqe in &mut cq {
             let io_id = usize::try_from(cqe.user_data()).unwrap();
             if io_id == close_file_io_id {
+                files_closing = files_closing.checked_sub(1).unwrap();
                 continue;
             }
             let task_id = *io.get(io_id).unwrap();
@@ -279,7 +290,7 @@ fn run(
                     }
                 }
                 Poll::Ready(_) => {
-                    let _ = tasks.remove(task_id);
+                    std::mem::drop(tasks.remove(task_id));
                 }
             }
         }
@@ -294,6 +305,7 @@ fn run(
         // close files
         FILES_TO_CLOSE.with_borrow_mut(|files| {
             while let Some(fd) = files.pop() {
+                files_closing = files_closing.checked_add(1).unwrap();
                 io_queue.push_back(
                     opcode::Close::new(Fd(fd))
                         .build()
@@ -328,4 +340,21 @@ const fn noop_raw_waker() -> RawWaker {
 #[inline]
 pub fn noop_waker() -> Waker {
     unsafe { Waker::from_raw(noop_raw_waker()) }
+}
+
+pub struct YieldIfNeeded;
+
+impl Future for YieldIfNeeded {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+            let ctx = ctx.as_mut().unwrap();
+            if ctx.should_yield() {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+    }
 }

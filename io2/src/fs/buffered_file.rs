@@ -11,7 +11,7 @@ use io_uring::opcode;
 use io_uring::types::Fd;
 use pin_project_lite::pin_project;
 
-use crate::executor::{BlockDeviceInfo, CURRENT_TASK_CONTEXT, FILES_TO_CLOSE};
+use crate::executor::{CURRENT_TASK_CONTEXT, FILES_TO_CLOSE};
 
 pub struct BufferedFile {
     fd: RawFd,
@@ -345,18 +345,6 @@ impl BufferedFile {
         let statx = self.statx().await?;
         Ok(statx.stx_size)
     }
-
-    pub async fn get_block_device_info(&self) -> io::Result<BlockDeviceInfo> {
-        let statx = self.statx().await?;
-        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
-            let ctx = ctx.as_mut().unwrap();
-            if let Some(info) = ctx.get_block_device_info(statx.stx_dev_major) {
-                return Ok(info);
-            }
-
-            todo!()
-        })
-    }
 }
 
 impl Drop for BufferedFile {
@@ -387,7 +375,7 @@ mod tests {
                 let mut out = vec![0; size.try_into().unwrap()];
                 let num_read = file.read(&mut out, 0).await.unwrap();
                 dbg!(num_read);
-                file.close().await.unwrap();
+                //file.close().await.unwrap();
                 println!("{}", String::from_utf8(out).unwrap());
             }))
             .unwrap();
