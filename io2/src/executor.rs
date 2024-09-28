@@ -31,17 +31,24 @@ type Task = Pin<Box<dyn Future<Output = ()>, DynAllocator>>;
 pub struct CurrentTaskContext {
     start: Instant,
     task_id: usize,
-    to_spawn: *mut Vec<Task, DynAllocator>,
+    tasks: *mut Slab<Task>,
     io_results: *mut IoResults,
     io_queue: *mut VecDeque<squeue::Entry, DynAllocator>,
     preempt_duration: Duration,
-    yielded: bool,
+    tasks_to_yield: *mut Vec<usize, DynAllocator>,
     block_device_infos: *mut BlockDeviceInfos,
     io: *mut Slab<usize>,
     alloc: DynAllocator,
+    to_notify: *mut ToNotify,
 }
 
 impl CurrentTaskContext {
+    pub(crate) fn notify(&mut self, task_id: usize) {
+        unsafe {
+            (&mut *self.to_notify).insert(task_id);
+        }
+    }
+
     pub(crate) fn take_io_result(&mut self, io_id: usize) -> Option<i32> {
         unsafe {
             match (*self.io_results).remove(&io_id) {
@@ -66,14 +73,36 @@ impl CurrentTaskContext {
         }
     }
 
-    pub fn should_yield(&self) -> bool {
-        self.start.elapsed() >= self.preempt_duration
+    pub fn yield_if_needed(&self) -> bool {
+        if self.start.elapsed() < self.preempt_duration {
+            false
+        } else {
+            unsafe { (&mut *self.tasks_to_yield).push(self.task_id) };
+            true
+        }
     }
 
-    pub fn spawn<F: Future<Output = ()> + 'static>(&mut self, future: F) {
-        unsafe {
-            (*self.to_spawn).push(Box::pin_in(future, self.alloc));
-        }
+    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(
+        &mut self,
+        future: F,
+    ) -> JoinHandle<T> {
+        let out = Rc::pin_in(RefCell::new(None), self.alloc);
+        let join_handle = JoinHandle { out: out.clone() };
+        let caller_task_id = self.task_id;
+        let task = Box::pin_in(
+            async move {
+                *out.borrow_mut() = Some(future.await);
+                CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+                    let ctx = ctx.as_mut().unwrap();
+                    ctx.notify(caller_task_id);
+                });
+            },
+            self.alloc,
+        );
+
+        let task_id = unsafe { (*self.tasks).insert(task) };
+        self.notify(task_id);
+        join_handle
     }
 
     /// Task will be pinned until the entry is completely processed by io_uring.
@@ -90,6 +119,13 @@ impl CurrentTaskContext {
             io_id
         }
     }
+}
+
+pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(future: F) -> JoinHandle<T> {
+    CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+        let ctx = ctx.as_mut().unwrap();
+        ctx.spawn(future)
+    })
 }
 
 pub struct ExecutorConfig {
@@ -161,13 +197,15 @@ fn run<T, F: Future<Output = T>>(
     let (submitter, mut sq, mut cq) = ring.split();
 
     let mut tasks = Slab::<Task>::with_capacity_in(128, alloc);
+    // we do this to upgrade the lifetime of `T` to static
+    // because the compiler isn't smart enough to understand CURRENT_TASK_CONTEXT isn't really 'static
+    let tasks_ptr = unsafe { std::mem::transmute(&mut tasks as *mut _) };
     let mut io = Slab::<usize>::with_capacity_in(128, alloc);
     let mut yielded_tasks = Vec::<usize, DynAllocator>::with_capacity_in(16, alloc);
     let mut tasks_to_yield = Vec::<usize, DynAllocator>::with_capacity_in(16, alloc);
     let mut io_queue = VecDeque::<squeue::Entry, DynAllocator>::with_capacity_in(128, alloc);
     let mut block_device_infos =
         BlockDeviceInfos::with_capacity_and_hasher_in(16, BuildNoHashHasher::default(), alloc);
-    let mut to_spawn = Vec::<Task, DynAllocator>::with_capacity_in(128, alloc);
     let mut io_results = IoResults::with_capacity_and_hasher_in(
         usize::try_from(ring_depth).unwrap() * 4,
         BuildNoHashHasher::default(),
@@ -175,49 +213,50 @@ fn run<T, F: Future<Output = T>>(
     );
     let mut to_notify =
         ToNotify::with_capacity_and_hasher_in(128, BuildNoHashHasher::default(), alloc);
+    let mut notifying = Vec::<usize, DynAllocator>::with_capacity_in(128, alloc);
 
     let close_file_task_id = tasks.insert(Box::pin_in(async {}, alloc));
     let close_file_io_id = io.insert(close_file_task_id);
     let mut files_closing = 0usize;
 
     let task_id = tasks.insert(task);
-    yielded_tasks.push(task_id);
+    to_notify.insert(task_id);
 
-    while tasks.len() > 1 || files_closing > 0 || FILES_TO_CLOSE.with_borrow(|x| !x.is_empty()) {
+    while out.is_none() || files_closing > 0 || FILES_TO_CLOSE.with_borrow(|x| !x.is_empty()) {
         // poll yielded tasks
+        yielded_tasks.clear();
+        yielded_tasks.extend(tasks_to_yield.iter().copied());
         for &task_id in yielded_tasks.iter() {
             CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                 *ctx = Some(CurrentTaskContext {
                     start: Instant::now(),
                     task_id,
-                    to_spawn: &mut to_spawn,
+                    // This is safe because slab contains only pointers to actual tasks,
+                    // we take a pointer and execute our task through it.
+                    // Even if the running tasks spawn another task and the pointer of the running task moves in the slab,
+                    // the actual task doesn't move.
+                    tasks: tasks_ptr,
                     io_results: &mut io_results,
                     io_queue: &mut io_queue,
                     preempt_duration,
-                    yielded: false,
+                    tasks_to_yield: &mut tasks_to_yield,
                     block_device_infos: &mut block_device_infos,
                     io: &mut io,
                     alloc,
+                    to_notify: &mut to_notify,
                 });
             });
             let poll_result = tasks.get_mut(task_id).unwrap().as_mut().poll(&mut poll_ctx);
-            let yielded = CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
-                let ctx = ctx.take().unwrap();
-                ctx.yielded
+            CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+                let _ = ctx.take().unwrap();
             });
             match poll_result {
-                Poll::Pending => {
-                    if yielded {
-                        tasks_to_yield.push(task_id);
-                    }
-                }
+                Poll::Pending => {}
                 Poll::Ready(_) => {
                     std::mem::drop(tasks.remove(task_id));
                 }
             }
         }
-        yielded_tasks.clear();
-        std::mem::swap(&mut yielded_tasks, &mut tasks_to_yield);
 
         sq.sync();
         if !sq.is_empty() {
@@ -270,43 +309,44 @@ fn run<T, F: Future<Output = T>>(
         }
 
         // poll tasks with finished io
-        for &task_id in to_notify.iter() {
+        notifying.clear();
+        notifying.extend(to_notify.iter().copied());
+        for &task_id in notifying.iter() {
             CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                 *ctx = Some(CurrentTaskContext {
                     start: Instant::now(),
                     task_id,
-                    to_spawn: &mut to_spawn,
+                    // This is safe because slab contains only pointers to actual tasks,
+                    // we take a pointer and execute our task through it.
+                    // Even if the running tasks spawn another task and the pointer of the running task moves in the slab,
+                    // the actual task doesn't move.
+                    tasks: tasks_ptr,
                     io_results: &mut io_results,
                     io_queue: &mut io_queue,
                     preempt_duration,
-                    yielded: false,
+                    tasks_to_yield: &mut tasks_to_yield,
                     block_device_infos: &mut block_device_infos,
                     io: &mut io,
                     alloc,
+                    to_notify: &mut to_notify,
                 });
             });
-            let poll_result = tasks.get_mut(task_id).unwrap().as_mut().poll(&mut poll_ctx);
-            let yielded = CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
-                let ctx = ctx.take().unwrap();
-                ctx.yielded
+            let poll_result = tasks
+                .get_mut(task_id)
+                .map(|task| task.as_mut().poll(&mut poll_ctx));
+            CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+                let _ = ctx.take().unwrap();
             });
+            let poll_result = match poll_result {
+                Some(p) => p,
+                None => continue,
+            };
             match poll_result {
-                Poll::Pending => {
-                    if yielded {
-                        yielded_tasks.push(task_id);
-                    }
-                }
+                Poll::Pending => {}
                 Poll::Ready(_) => {
                     std::mem::drop(tasks.remove(task_id));
                 }
             }
-        }
-        to_notify.clear();
-
-        // spawn tasks
-        while let Some(task) = to_spawn.pop() {
-            let task_id = tasks.insert(task);
-            yielded_tasks.push(task_id);
         }
 
         // close files
@@ -357,42 +397,56 @@ impl Future for YieldIfNeeded {
     fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
         CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
             let ctx = ctx.as_mut().unwrap();
-            if ctx.should_yield() {
-                Poll::Pending
-            } else {
+            if !ctx.yield_if_needed() {
                 Poll::Ready(())
+            } else {
+                Poll::Pending
             }
         })
     }
 }
 
-struct Oneshot<T> {
-    val: Pin<Box<T, DynAllocator>>,
-    io_id: Option<usize>,
+pub struct JoinHandle<T> {
+    out: Pin<Rc<RefCell<Option<T>>, DynAllocator>>,
 }
 
-struct OneshotSender<T> {
-    inner: Rc<RefCell<Oneshot<T>>>,
-}
-
-struct OneshotReceiver<T> {
-    inner: Rc<RefCell<Oneshot<T>>>,
-}
-
-impl<T> Future for OneshotReceiver<T> {
+impl<T> Future for JoinHandle<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
-        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
-            let ctx = ctx.as_mut().unwrap();
-            let fut = self.get_mut();
-            let inner = fut.inner.borrow_mut();
-            match inner.io_id {
-                None => {}
-                Some(io_id) => {}
-            }
+        match self.get_mut().out.take() {
+            Some(v) => Poll::Ready(v.into()),
+            None => Poll::Pending,
+        }
+    }
+}
 
-            todo!()
-        })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_spawn() {
+        let r = ExecutorConfig::new()
+            .run(async {
+                for _ in 0..5 {
+                    YieldIfNeeded.await;
+                }
+
+                let handle1 = spawn(async { 1 });
+
+                YieldIfNeeded.await;
+
+                let handle2 = spawn(async { 2 });
+
+                YieldIfNeeded.await;
+
+                assert_eq!(2, handle2.await);
+                assert_eq!(1, handle1.await);
+
+                0
+            })
+            .unwrap();
+        assert_eq!(r, 0);
     }
 }
