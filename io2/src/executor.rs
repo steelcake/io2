@@ -6,6 +6,7 @@ use std::{
     io,
     os::fd::RawFd,
     pin::Pin,
+    rc::Rc,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     time::{Duration, Instant},
 };
@@ -127,22 +128,28 @@ impl ExecutorConfig {
         self
     }
 
-    pub fn run<F: Future<Output = ()> + 'static>(self, future: F) -> io::Result<()> {
-        run(
-            self.alloc,
-            self.ring_depth,
-            self.preempt_duration,
-            Box::pin_in(future, self.alloc),
-        )
+    pub fn run<T, F: Future<Output = T>>(self, future: F) -> io::Result<T> {
+        run(self.alloc, self.ring_depth, self.preempt_duration, future)
     }
 }
 
-fn run(
+fn run<T, F: Future<Output = T>>(
     alloc: DynAllocator,
     ring_depth: u32,
     preempt_duration: Duration,
-    task: Task,
-) -> io::Result<()> {
+    future: F,
+) -> io::Result<T> {
+    let mut out = Option::<T>::None;
+    let out_ptr = &mut out as *mut Option<T>;
+    let task = Box::pin_in(
+        async move {
+            unsafe {
+                *out_ptr = Some(future.await);
+            }
+        },
+        alloc,
+    );
+
     let waker = noop_waker();
     let mut poll_ctx = Context::from_waker(&waker);
 
@@ -315,7 +322,7 @@ fn run(
         });
     }
 
-    Ok(())
+    Ok(out.unwrap())
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -355,6 +362,37 @@ impl Future for YieldIfNeeded {
             } else {
                 Poll::Ready(())
             }
+        })
+    }
+}
+
+struct Oneshot<T> {
+    val: Pin<Box<T, DynAllocator>>,
+    io_id: Option<usize>,
+}
+
+struct OneshotSender<T> {
+    inner: Rc<RefCell<Oneshot<T>>>,
+}
+
+struct OneshotReceiver<T> {
+    inner: Rc<RefCell<Oneshot<T>>>,
+}
+
+impl<T> Future for OneshotReceiver<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+            let ctx = ctx.as_mut().unwrap();
+            let fut = self.get_mut();
+            let inner = fut.inner.borrow_mut();
+            match inner.io_id {
+                None => {}
+                Some(io_id) => {}
+            }
+
+            todo!()
         })
     }
 }

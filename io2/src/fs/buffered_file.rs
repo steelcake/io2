@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn smoke_test() {
-        ExecutorConfig::new()
+        let x = ExecutorConfig::new()
             .run(Box::pin(async {
                 let file = BufferedFile::open(Path::new("Cargo.toml"), libc::O_RDONLY, 0)
                     .unwrap()
@@ -377,7 +377,12 @@ mod tests {
                 dbg!(num_read);
                 //file.close().await.unwrap();
                 println!("{}", String::from_utf8(out).unwrap());
+
+                5
             }))
             .unwrap();
+
+        assert_eq!(x, 5);
+        dbg!(x);
     }
 }
