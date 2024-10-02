@@ -7,13 +7,13 @@ extern crate std as alloc;
 use core::{mem, ops};
 use std::alloc::Allocator;
 
-pub struct Slab<T> {
-    entries: Vec<Entry<T>, &'static dyn Allocator>,
+pub struct Slab<T, A: Allocator> {
+    entries: Vec<Entry<T>, A>,
     len: usize,
     next: usize,
 }
 
-impl<T> Clone for Slab<T>
+impl<T, A: Allocator + Clone> Clone for Slab<T, A>
 where
     T: Clone,
 {
@@ -32,8 +32,8 @@ where
     }
 }
 
-pub struct VacantEntry<'a, T> {
-    slab: &'a mut Slab<T>,
+pub struct VacantEntry<'a, T, A: Allocator> {
+    slab: &'a mut Slab<T, A>,
     key: usize,
 }
 
@@ -43,8 +43,8 @@ enum Entry<T> {
     Occupied(T),
 }
 
-impl<T> Slab<T> {
-    pub const fn new_in(alloc: &'static dyn Allocator) -> Self {
+impl<T, A: Allocator> Slab<T, A> {
+    pub const fn new_in(alloc: A) -> Self {
         Self {
             entries: Vec::new_in(alloc),
             next: 0,
@@ -52,7 +52,7 @@ impl<T> Slab<T> {
         }
     }
 
-    pub fn with_capacity_in(capacity: usize, alloc: &'static dyn Allocator) -> Slab<T> {
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Slab<T, A> {
         Slab {
             entries: Vec::with_capacity_in(capacity, alloc),
             next: 0,
@@ -117,11 +117,11 @@ impl<T> Slab<T> {
         F: FnMut(&mut T, usize, usize) -> bool,
     {
         // If the closure unwinds, we need to restore a valid list of vacant entries
-        struct CleanupGuard<'a, T> {
-            slab: &'a mut Slab<T>,
+        struct CleanupGuard<'a, T, A: Allocator> {
+            slab: &'a mut Slab<T, A>,
             decrement: bool,
         }
-        impl<T> Drop for CleanupGuard<'_, T> {
+        impl<T, A: Allocator> Drop for CleanupGuard<'_, T, A> {
             fn drop(&mut self) {
                 if self.decrement {
                     // Value was popped and not pushed back on
@@ -274,7 +274,7 @@ impl<T> Slab<T> {
         self.next
     }
 
-    pub fn vacant_entry(&mut self) -> VacantEntry<'_, T> {
+    pub fn vacant_entry(&mut self) -> VacantEntry<'_, T, A> {
         VacantEntry {
             key: self.next,
             slab: self,
@@ -341,7 +341,7 @@ impl<T> Slab<T> {
     }
 }
 
-impl<T> ops::Index<usize> for Slab<T> {
+impl<T, A: Allocator> ops::Index<usize> for Slab<T, A> {
     type Output = T;
 
     fn index(&self, key: usize) -> &T {
@@ -352,7 +352,7 @@ impl<T> ops::Index<usize> for Slab<T> {
     }
 }
 
-impl<T> ops::IndexMut<usize> for Slab<T> {
+impl<T, A: Allocator> ops::IndexMut<usize> for Slab<T, A> {
     fn index_mut(&mut self, key: usize) -> &mut T {
         match self.entries.get_mut(key) {
             Some(&mut Entry::Occupied(ref mut v)) => v,
@@ -363,7 +363,7 @@ impl<T> ops::IndexMut<usize> for Slab<T> {
 
 // ===== VacantEntry =====
 
-impl<'a, T> VacantEntry<'a, T> {
+impl<'a, T, A: Allocator> VacantEntry<'a, T, A> {
     pub fn insert(self, val: T) -> &'a mut T {
         self.slab.insert_at(self.key, val);
 

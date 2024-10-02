@@ -1,5 +1,4 @@
 use std::{
-    alloc::Allocator,
     cell::RefCell,
     collections::VecDeque,
     future::Future,
@@ -15,14 +14,17 @@ use hashbrown::{HashMap, HashSet};
 use io_uring::{cqueue, opcode, squeue, types::Fd, IoUring};
 use nohash_hasher::BuildNoHashHasher;
 
-use crate::slab::Slab;
+use crate::{
+    local_alloc::LocalAlloc,
+    slab::Slab,
+};
 
 thread_local! {
     pub static CURRENT_TASK_CONTEXT: RefCell<Option<CurrentTaskContext>> = const { RefCell::new(None) };
-    pub static FILES_TO_CLOSE: RefCell<Vec<RawFd>> = RefCell::new(Vec::with_capacity(64));
+    pub static FILES_TO_CLOSE: RefCell<Vec<RawFd>> = RefCell::new(Vec::with_capacity(128));
 }
 
-type DynAllocator = &'static dyn Allocator;
+type DynAllocator = LocalAlloc;
 type IoResults = HashMap<usize, i32, BuildNoHashHasher<usize>, DynAllocator>;
 type BlockDeviceInfos = HashMap<u32, BlockDeviceInfo, BuildNoHashHasher<u32>, DynAllocator>;
 type ToNotify = HashSet<usize, BuildNoHashHasher<usize>, DynAllocator>;
@@ -31,14 +33,13 @@ type Task = Pin<Box<dyn Future<Output = ()>, DynAllocator>>;
 pub struct CurrentTaskContext {
     start: Instant,
     task_id: usize,
-    tasks: *mut Slab<Task>,
+    tasks: *mut Slab<Task, DynAllocator>,
     io_results: *mut IoResults,
     io_queue: *mut VecDeque<squeue::Entry, DynAllocator>,
     preempt_duration: Duration,
     tasks_to_yield: *mut Vec<usize, DynAllocator>,
     block_device_infos: *mut BlockDeviceInfos,
-    io: *mut Slab<usize>,
-    alloc: DynAllocator,
+    io: *mut Slab<usize, DynAllocator>,
     to_notify: *mut ToNotify,
 }
 
@@ -86,7 +87,7 @@ impl CurrentTaskContext {
         &mut self,
         future: F,
     ) -> JoinHandle<T> {
-        let out = Rc::pin_in(RefCell::new(None), self.alloc);
+        let out = Rc::pin_in(RefCell::new(None), LocalAlloc::new());
         let join_handle = JoinHandle { out: out.clone() };
         let caller_task_id = self.task_id;
         let task = Box::pin_in(
@@ -97,7 +98,7 @@ impl CurrentTaskContext {
                     ctx.notify(caller_task_id);
                 });
             },
-            self.alloc,
+            LocalAlloc::new(),
         );
 
         let task_id = unsafe { (*self.tasks).insert(task) };
@@ -129,7 +130,6 @@ pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(future: F) -> JoinHand
 }
 
 pub struct ExecutorConfig {
-    alloc: DynAllocator,
     ring_depth: u32,
     preempt_duration: Duration,
 }
@@ -143,15 +143,9 @@ impl Default for ExecutorConfig {
 impl ExecutorConfig {
     pub fn new() -> Self {
         Self {
-            alloc: &std::alloc::Global,
             ring_depth: 64,
             preempt_duration: Duration::from_millis(100),
         }
-    }
-
-    pub fn alloc(mut self, alloc: DynAllocator) -> Self {
-        self.alloc = alloc;
-        self
     }
 
     pub fn ring_depth(mut self, ring_depth: u32) -> Self {
@@ -165,12 +159,14 @@ impl ExecutorConfig {
     }
 
     pub fn run<T, F: Future<Output = T>>(self, future: F) -> io::Result<T> {
-        run(self.alloc, self.ring_depth, self.preempt_duration, future)
+        run(self.ring_depth, self.preempt_duration, future)
     }
 }
 
+// TODO: Don't leak the file descriptors in FILES_TO_CLOSE when returning error.
+// this is almost ok since they will be cleaned when/if another executor runs in this thread. But
+// is a problem if user is spawning more and more threads and running executors in them.
 fn run<T, F: Future<Output = T>>(
-    alloc: DynAllocator,
     ring_depth: u32,
     preempt_duration: Duration,
     future: F,
@@ -183,7 +179,7 @@ fn run<T, F: Future<Output = T>>(
                 *out_ptr = Some(future.await);
             }
         },
-        alloc,
+        LocalAlloc::new(),
     );
 
     let waker = noop_waker();
@@ -196,26 +192,26 @@ fn run<T, F: Future<Output = T>>(
         .build(ring_depth)?;
     let (submitter, mut sq, mut cq) = ring.split();
 
-    let mut tasks = Slab::<Task>::with_capacity_in(128, alloc);
+    let mut tasks = Slab::<Task, DynAllocator>::with_capacity_in(128, LocalAlloc::new());
     // we do this to upgrade the lifetime of `T` to static
     // because the compiler isn't smart enough to understand CURRENT_TASK_CONTEXT isn't really 'static
     let tasks_ptr = unsafe { std::mem::transmute(&mut tasks as *mut _) };
-    let mut io = Slab::<usize>::with_capacity_in(128, alloc);
-    let mut yielded_tasks = Vec::<usize, DynAllocator>::with_capacity_in(16, alloc);
-    let mut tasks_to_yield = Vec::<usize, DynAllocator>::with_capacity_in(16, alloc);
-    let mut io_queue = VecDeque::<squeue::Entry, DynAllocator>::with_capacity_in(128, alloc);
+    let mut io = Slab::<usize, DynAllocator>::with_capacity_in(128, LocalAlloc::new());
+    let mut yielded_tasks = Vec::<usize, DynAllocator>::with_capacity_in(16, LocalAlloc::new());
+    let mut tasks_to_yield = Vec::<usize, DynAllocator>::with_capacity_in(16, LocalAlloc::new());
+    let mut io_queue = VecDeque::<squeue::Entry, DynAllocator>::with_capacity_in(128, LocalAlloc::new());
     let mut block_device_infos =
-        BlockDeviceInfos::with_capacity_and_hasher_in(16, BuildNoHashHasher::default(), alloc);
+        BlockDeviceInfos::with_capacity_and_hasher_in(16, BuildNoHashHasher::default(), LocalAlloc::new());
     let mut io_results = IoResults::with_capacity_and_hasher_in(
         usize::try_from(ring_depth).unwrap() * 4,
         BuildNoHashHasher::default(),
-        alloc,
+        LocalAlloc::new(),
     );
     let mut to_notify =
-        ToNotify::with_capacity_and_hasher_in(128, BuildNoHashHasher::default(), alloc);
-    let mut notifying = Vec::<usize, DynAllocator>::with_capacity_in(128, alloc);
+        ToNotify::with_capacity_and_hasher_in(128, BuildNoHashHasher::default(), LocalAlloc::new());
+    let mut notifying = Vec::<usize, DynAllocator>::with_capacity_in(128, LocalAlloc::new());
 
-    let close_file_task_id = tasks.insert(Box::pin_in(async {}, alloc));
+    let close_file_task_id = tasks.insert(Box::pin_in(async {}, LocalAlloc::new()));
     let close_file_io_id = io.insert(close_file_task_id);
     let mut files_closing = 0usize;
 
@@ -242,7 +238,6 @@ fn run<T, F: Future<Output = T>>(
                     tasks_to_yield: &mut tasks_to_yield,
                     block_device_infos: &mut block_device_infos,
                     io: &mut io,
-                    alloc,
                     to_notify: &mut to_notify,
                 });
             });
@@ -327,7 +322,6 @@ fn run<T, F: Future<Output = T>>(
                     tasks_to_yield: &mut tasks_to_yield,
                     block_device_infos: &mut block_device_infos,
                     io: &mut io,
-                    alloc,
                     to_notify: &mut to_notify,
                 });
             });

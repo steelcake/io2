@@ -5,3 +5,4 @@ pub mod fs;
 pub mod io_buffer;
 #[allow(clippy::all)]
 pub mod slab;
+pub mod local_alloc;
