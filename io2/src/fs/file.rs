@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::io;
+use std::marker::PhantomData;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -15,11 +16,13 @@ use crate::local_alloc::LocalAlloc;
 
 pub struct File {
     fd: RawFd,
+    _non_send: PhantomData<*mut ()>,
 }
 
 pub struct Close {
     io_id: Option<usize>,
     fd: RawFd,
+    _non_send: PhantomData<*mut ()>,
 }
 
 impl Future for Close {
@@ -59,6 +62,7 @@ pin_project! {
         path: LocalCString,
         #[pin] how: libc::open_how,
         io_id: Option<usize>,
+        _non_send: PhantomData<*mut ()>,
     }
 }
 
@@ -97,7 +101,10 @@ impl Future for Open {
                         io_result
                     };
 
-                    Poll::Ready(Ok(File { fd }))
+                    Poll::Ready(Ok(File {
+                        fd,
+                        _non_send: PhantomData,
+                    }))
                 }
             }
         })
@@ -109,6 +116,7 @@ pub struct Read<'file, 'buf> {
     offset: u64,
     buf: &'buf mut [u8],
     io_id: Option<usize>,
+    _non_send: PhantomData<*mut ()>,
 }
 
 impl<'file, 'buf> Future for Read<'file, 'buf> {
@@ -157,6 +165,7 @@ pub struct Write<'file, 'buf> {
     offset: u64,
     buf: &'buf [u8],
     io_id: Option<usize>,
+    _non_send: PhantomData<*mut ()>,
 }
 
 impl<'file, 'buf> Future for Write<'file, 'buf> {
@@ -205,6 +214,7 @@ pin_project! {
         file: &'file File,
         io_id: Option<usize>,
         #[pin] statx: libc::statx,
+        _non_send: PhantomData<*mut ()>,
     }
 }
 
@@ -258,6 +268,7 @@ impl<'file> Future for Statx<'file> {
 pub struct SyncAll<'file> {
     file: &'file File,
     io_id: Option<usize>,
+    _non_send: PhantomData<*mut ()>,
 }
 
 impl<'file> Future for SyncAll<'file> {
@@ -298,15 +309,23 @@ struct LocalCString {
 }
 
 impl LocalCString {
-    fn from_path(path: &Path) -> Self {
+    fn from_path(path: &Path) -> io::Result<Self> {
         let path_ref = path.as_os_str().as_bytes();
+
+        if path_ref.contains(&b'\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "null value in path",
+            ));
+        }
+
         let mut path = Vec::with_capacity_in(path_ref.len() + 1, LocalAlloc::new());
         // Safety: this is safe because next lines can't panic, and we write up to the new length.
         unsafe { path.set_len(path_ref.len() + 1) };
         path[..path_ref.len()].copy_from_slice(path_ref);
         path[path_ref.len()] = b'\0';
 
-        Self { path }
+        Ok(Self { path })
     }
 
     fn as_c_str(&self) -> *const libc::c_char {
@@ -316,7 +335,7 @@ impl LocalCString {
 
 impl File {
     pub fn open(path: &Path, flags: i32, mode: i32) -> io::Result<Open> {
-        let path = LocalCString::from_path(path);
+        let path = LocalCString::from_path(path)?;
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
         how.flags = flags as u64;
         how.mode = mode as u64;
@@ -324,6 +343,7 @@ impl File {
             path,
             how,
             io_id: None,
+            _non_send: PhantomData,
         })
     }
 
@@ -333,6 +353,7 @@ impl File {
             buf,
             file: self,
             io_id: None,
+            _non_send: PhantomData,
         }
     }
 
@@ -342,6 +363,7 @@ impl File {
             buf,
             file: self,
             io_id: None,
+            _non_send: PhantomData,
         }
     }
 
@@ -349,13 +371,18 @@ impl File {
         SyncAll {
             file: self,
             io_id: None,
+            _non_send: PhantomData,
         }
     }
 
     pub fn close(self) -> Close {
         let fd = self.fd;
         std::mem::forget(self);
-        Close { io_id: None, fd }
+        Close {
+            io_id: None,
+            fd,
+            _non_send: PhantomData,
+        }
     }
 
     fn statx(&self) -> Statx<'_> {
@@ -363,6 +390,7 @@ impl File {
             file: self,
             io_id: None,
             statx: unsafe { std::mem::zeroed() },
+            _non_send: PhantomData,
         }
     }
 

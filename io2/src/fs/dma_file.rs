@@ -1,9 +1,19 @@
-// use super::buffered_file::BufferedFile;
+use std::{io, path::Path};
 
-// pub struct DmaFile {
-//     inner: BufferedFile,
-// }
+use super::file::File;
 
-// impl DmaFile {
-//     pub fn open()
-// }
+pub struct DmaFile {
+    file: File,
+}
+
+impl DmaFile {
+    pub async fn open(path: &Path, flags: i32, mode: i32) -> io::Result<DmaFile> {
+        Ok(DmaFile {
+            file: File::open(path, flags, mode)?.await?,
+        })
+    }
+
+    pub fn as_file(&self) -> &File {
+        &self.file
+    }
+}

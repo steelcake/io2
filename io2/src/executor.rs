@@ -17,8 +17,8 @@ use nohash_hasher::BuildNoHashHasher;
 use crate::{local_alloc::LocalAlloc, slab::Slab};
 
 thread_local! {
-    pub static CURRENT_TASK_CONTEXT: RefCell<Option<CurrentTaskContext>> = const { RefCell::new(None) };
-    pub static FILES_TO_CLOSE: RefCell<Vec<RawFd>> = RefCell::new(Vec::with_capacity(128));
+    pub(crate) static CURRENT_TASK_CONTEXT: RefCell<Option<CurrentTaskContext>> = const { RefCell::new(None) };
+    pub(crate) static FILES_TO_CLOSE: RefCell<Vec<RawFd>> = RefCell::new(Vec::with_capacity(128));
 }
 
 type IoResults = HashMap<usize, i32, BuildNoHashHasher<usize>, LocalAlloc>;
