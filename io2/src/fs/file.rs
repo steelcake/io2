@@ -1,6 +1,5 @@
-use std::ffi::CString;
 use std::future::Future;
-use std::io::{self, ErrorKind};
+use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -12,8 +11,9 @@ use io_uring::types::Fd;
 use pin_project_lite::pin_project;
 
 use crate::executor::{CURRENT_TASK_CONTEXT, FILES_TO_CLOSE};
+use crate::local_alloc::LocalAlloc;
 
-pub struct BufferedFile {
+pub struct File {
     fd: RawFd,
 }
 
@@ -56,14 +56,14 @@ impl Future for Close {
 
 pin_project! {
     pub struct Open {
-        path: CString,
+        path: LocalCString,
         #[pin] how: libc::open_how,
         io_id: Option<usize>,
     }
 }
 
 impl Future for Open {
-    type Output = io::Result<BufferedFile>;
+    type Output = io::Result<File>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
@@ -75,7 +75,7 @@ impl Future for Open {
                         ctx.queue_io(
                             opcode::OpenAt2::new(
                                 Fd(libc::AT_FDCWD),
-                                fut.path.as_ptr(),
+                                fut.path.as_c_str(),
                                 &*fut.how as *const libc::open_how as *const _,
                             )
                             .build(),
@@ -97,7 +97,7 @@ impl Future for Open {
                         io_result
                     };
 
-                    Poll::Ready(Ok(BufferedFile { fd }))
+                    Poll::Ready(Ok(File { fd }))
                 }
             }
         })
@@ -105,7 +105,7 @@ impl Future for Open {
 }
 
 pub struct Read<'file, 'buf> {
-    file: &'file BufferedFile,
+    file: &'file File,
     offset: u64,
     buf: &'buf mut [u8],
     io_id: Option<usize>,
@@ -153,7 +153,7 @@ impl<'file, 'buf> Future for Read<'file, 'buf> {
 }
 
 pub struct Write<'file, 'buf> {
-    file: &'file BufferedFile,
+    file: &'file File,
     offset: u64,
     buf: &'buf [u8],
     io_id: Option<usize>,
@@ -202,11 +202,16 @@ impl<'file, 'buf> Future for Write<'file, 'buf> {
 
 pin_project! {
     struct Statx<'file> {
-        file: &'file BufferedFile,
+        file: &'file File,
         io_id: Option<usize>,
         #[pin] statx: libc::statx,
-        empty_path: CString,
     }
+}
+
+static EMPTY_PATH: u8 = b'\0';
+
+fn empty_path() -> *const libc::c_char {
+    &EMPTY_PATH as *const u8 as *const libc::c_char
 }
 
 impl<'file> Future for Statx<'file> {
@@ -222,7 +227,7 @@ impl<'file> Future for Statx<'file> {
                         ctx.queue_io(
                             opcode::Statx::new(
                                 Fd(fut.file.fd),
-                                fut.empty_path.as_ptr(),
+                                empty_path(),
                                 &*fut.statx as *const libc::statx as *mut _,
                             )
                             .flags(libc::AT_EMPTY_PATH)
@@ -251,7 +256,7 @@ impl<'file> Future for Statx<'file> {
 }
 
 pub struct SyncAll<'file> {
-    file: &'file BufferedFile,
+    file: &'file File,
     io_id: Option<usize>,
 }
 
@@ -287,10 +292,30 @@ impl<'file> Future for SyncAll<'file> {
     }
 }
 
-impl BufferedFile {
+// This is because std CString doesn't support allocator api
+struct LocalCString {
+    path: Vec<u8, LocalAlloc>,
+}
+
+impl LocalCString {
+    fn from_path(path: &Path) -> Self {
+        let path_ref = path.as_os_str().as_bytes();
+        let mut path = Vec::with_capacity_in(path_ref.len() + 1, LocalAlloc::new());
+        path[..path_ref.len()].copy_from_slice(path_ref);
+        path[path_ref.len()] = b'\0';
+        unsafe { path.set_len(path_ref.len() + 1) };
+
+        Self { path }
+    }
+
+    fn as_c_str(&self) -> *const libc::c_char {
+        self.path.as_ptr() as *const libc::c_char
+    }
+}
+
+impl File {
     pub fn open(path: &Path, flags: i32, mode: i32) -> io::Result<Open> {
-        let path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
+        let path = LocalCString::from_path(path);
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
         how.flags = flags as u64;
         how.mode = mode as u64;
@@ -337,7 +362,6 @@ impl BufferedFile {
             file: self,
             io_id: None,
             statx: unsafe { std::mem::zeroed() },
-            empty_path: CString::new(Vec::new()).unwrap(),
         }
     }
 
@@ -347,7 +371,7 @@ impl BufferedFile {
     }
 }
 
-impl Drop for BufferedFile {
+impl Drop for File {
     fn drop(&mut self) {
         FILES_TO_CLOSE.with_borrow_mut(|files| {
             files.push(self.fd);
@@ -365,7 +389,7 @@ mod tests {
     fn smoke_test() {
         let x = ExecutorConfig::new()
             .run(Box::pin(async {
-                let file = BufferedFile::open(Path::new("Cargo.toml"), libc::O_RDONLY, 0)
+                let file = File::open(Path::new("Cargo.toml"), libc::O_RDONLY, 0)
                     .unwrap()
                     .await
                     .unwrap();

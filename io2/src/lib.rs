@@ -1,4 +1,5 @@
 #![feature(allocator_api)]
+#![allow(clippy::new_without_default)]
 
 pub mod executor;
 pub mod fs;

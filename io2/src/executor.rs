@@ -21,22 +21,21 @@ thread_local! {
     pub static FILES_TO_CLOSE: RefCell<Vec<RawFd>> = RefCell::new(Vec::with_capacity(128));
 }
 
-type DynAllocator = LocalAlloc;
-type IoResults = HashMap<usize, i32, BuildNoHashHasher<usize>, DynAllocator>;
-type BlockDeviceInfos = HashMap<u32, BlockDeviceInfo, BuildNoHashHasher<u32>, DynAllocator>;
-type ToNotify = HashSet<usize, BuildNoHashHasher<usize>, DynAllocator>;
-type Task = Pin<Box<dyn Future<Output = ()>, DynAllocator>>;
+type IoResults = HashMap<usize, i32, BuildNoHashHasher<usize>, LocalAlloc>;
+type BlockDeviceInfos = HashMap<u32, BlockDeviceInfo, BuildNoHashHasher<u32>, LocalAlloc>;
+type ToNotify = HashSet<usize, BuildNoHashHasher<usize>, LocalAlloc>;
+type Task = Pin<Box<dyn Future<Output = ()>, LocalAlloc>>;
 
 pub struct CurrentTaskContext {
     start: Instant,
     task_id: usize,
-    tasks: *mut Slab<Task, DynAllocator>,
+    tasks: *mut Slab<Task, LocalAlloc>,
     io_results: *mut IoResults,
-    io_queue: *mut VecDeque<squeue::Entry, DynAllocator>,
+    io_queue: *mut VecDeque<squeue::Entry, LocalAlloc>,
     preempt_duration: Duration,
-    tasks_to_yield: *mut Vec<usize, DynAllocator>,
+    tasks_to_yield: *mut Vec<usize, LocalAlloc>,
     block_device_infos: *mut BlockDeviceInfos,
-    io: *mut Slab<usize, DynAllocator>,
+    io: *mut Slab<usize, LocalAlloc>,
     to_notify: *mut ToNotify,
 }
 
@@ -45,7 +44,7 @@ struct CurrentTaskContextGuard;
 impl Drop for CurrentTaskContextGuard {
     fn drop(&mut self) {
         CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
-            std::mem::drop(ctx.take());
+            *ctx = None;
         });
     }
 }
@@ -53,7 +52,7 @@ impl Drop for CurrentTaskContextGuard {
 impl CurrentTaskContext {
     pub(crate) fn notify(&mut self, task_id: usize) {
         unsafe {
-            (&mut *self.to_notify).insert(task_id);
+            (*self.to_notify).insert(task_id);
         }
     }
 
@@ -85,7 +84,7 @@ impl CurrentTaskContext {
         if self.start.elapsed() < self.preempt_duration {
             false
         } else {
-            unsafe { (&mut *self.tasks_to_yield).push(self.task_id) };
+            unsafe { (*self.tasks_to_yield).push(self.task_id) };
             true
         }
     }
@@ -165,7 +164,7 @@ impl ExecutorConfig {
         self
     }
 
-    pub fn run<T, F: Future<Output = T>>(self, future: F) -> io::Result<T> {
+    pub fn run<T: 'static, F: Future<Output = T> + 'static>(self, future: F) -> io::Result<T> {
         run(self.ring_depth, self.preempt_duration, future)
     }
 }
@@ -173,14 +172,14 @@ impl ExecutorConfig {
 // TODO: Don't leak the file descriptors in FILES_TO_CLOSE when returning error.
 // this is almost ok since they will be cleaned when/if another executor runs in this thread. But
 // is a problem if user is spawning more and more threads and running executors in them.
-fn run<T, F: Future<Output = T>>(
+fn run<T: 'static, F: Future<Output = T> + 'static>(
     ring_depth: u32,
     preempt_duration: Duration,
     future: F,
 ) -> io::Result<T> {
     // This is to cleanup the thread local variable if there is a panic.
     // It makes sure we are panic/unwind safe.
-    let _guard = CurrentTaskContextGuard;
+    let _current_task_context_guard = CurrentTaskContextGuard;
 
     let mut out = Option::<T>::None;
     let out_ptr = &mut out as *mut Option<T>;
@@ -203,15 +202,12 @@ fn run<T, F: Future<Output = T>>(
         .build(ring_depth)?;
     let (submitter, mut sq, mut cq) = ring.split();
 
-    let mut tasks = Slab::<Task, DynAllocator>::with_capacity_in(128, LocalAlloc::new());
-    // we do this to upgrade the lifetime of `T` to static
-    // because the compiler isn't smart enough to understand CURRENT_TASK_CONTEXT isn't really 'static
-    let tasks_ptr = unsafe { std::mem::transmute(&mut tasks as *mut _) };
-    let mut io = Slab::<usize, DynAllocator>::with_capacity_in(128, LocalAlloc::new());
-    let mut yielded_tasks = Vec::<usize, DynAllocator>::with_capacity_in(16, LocalAlloc::new());
-    let mut tasks_to_yield = Vec::<usize, DynAllocator>::with_capacity_in(16, LocalAlloc::new());
+    let mut tasks = Slab::<Task, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
+    let mut io = Slab::<usize, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
+    let mut yielded_tasks = Vec::<usize, LocalAlloc>::with_capacity_in(16, LocalAlloc::new());
+    let mut tasks_to_yield = Vec::<usize, LocalAlloc>::with_capacity_in(16, LocalAlloc::new());
     let mut io_queue =
-        VecDeque::<squeue::Entry, DynAllocator>::with_capacity_in(128, LocalAlloc::new());
+        VecDeque::<squeue::Entry, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
     let mut block_device_infos = BlockDeviceInfos::with_capacity_and_hasher_in(
         16,
         BuildNoHashHasher::default(),
@@ -224,7 +220,7 @@ fn run<T, F: Future<Output = T>>(
     );
     let mut to_notify =
         ToNotify::with_capacity_and_hasher_in(128, BuildNoHashHasher::default(), LocalAlloc::new());
-    let mut notifying = Vec::<usize, DynAllocator>::with_capacity_in(128, LocalAlloc::new());
+    let mut notifying = Vec::<usize, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
 
     let close_file_task_id = tasks.insert(Box::pin_in(async {}, LocalAlloc::new()));
     let close_file_io_id = io.insert(close_file_task_id);
@@ -246,7 +242,7 @@ fn run<T, F: Future<Output = T>>(
                     // we take a pointer and execute our task through it.
                     // Even if the running tasks spawn another task and the pointer of the running task moves in the slab,
                     // the actual task doesn't move.
-                    tasks: tasks_ptr,
+                    tasks: &mut tasks,
                     io_results: &mut io_results,
                     io_queue: &mut io_queue,
                     preempt_duration,
@@ -330,7 +326,7 @@ fn run<T, F: Future<Output = T>>(
                     // we take a pointer and execute our task through it.
                     // Even if the running tasks spawn another task and the pointer of the running task moves in the slab,
                     // the actual task doesn't move.
-                    tasks: tasks_ptr,
+                    tasks: &mut tasks,
                     io_results: &mut io_results,
                     io_queue: &mut io_queue,
                     preempt_duration,
@@ -416,7 +412,7 @@ impl Future for YieldIfNeeded {
 }
 
 pub struct JoinHandle<T> {
-    out: Pin<Rc<RefCell<Option<T>>, DynAllocator>>,
+    out: Pin<Rc<RefCell<Option<T>>, LocalAlloc>>,
 }
 
 impl<T> Future for JoinHandle<T> {
@@ -424,7 +420,7 @@ impl<T> Future for JoinHandle<T> {
 
     fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
         match self.get_mut().out.take() {
-            Some(v) => Poll::Ready(v.into()),
+            Some(v) => Poll::Ready(v),
             None => Poll::Pending,
         }
     }
