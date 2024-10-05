@@ -180,7 +180,7 @@ fn run<T, F: Future<Output = T>>(
 ) -> io::Result<T> {
     // This is to cleanup the thread local variable if there is a panic.
     // It makes sure we are panic/unwind safe.
-    let _ = CurrentTaskContextGuard;
+    let _guard = CurrentTaskContextGuard;
 
     let mut out = Option::<T>::None;
     let out_ptr = &mut out as *mut Option<T>;
@@ -432,6 +432,8 @@ impl<T> Future for JoinHandle<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::catch_unwind;
+
     use super::*;
 
     #[test]
@@ -457,5 +459,16 @@ mod tests {
             })
             .unwrap();
         assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn test_unwind_cleanup() {
+        let _ = catch_unwind(|| {
+            ExecutorConfig::new()
+                .run(async { panic!("unwind to leak CURRENT_TASK_CONTEXT") })
+                .unwrap();
+        });
+
+        assert!(CURRENT_TASK_CONTEXT.with_borrow_mut(|x| x.is_none()));
     }
 }

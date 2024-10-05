@@ -25,13 +25,13 @@ struct FreeRange {
 
 #[derive(Clone, Copy)]
 pub struct LocalAlloc {
-    _marker: PhantomData<*mut u8>,
+    _non_send: PhantomData<*mut ()>,
 }
 
 impl LocalAlloc {
     pub fn new() -> Self {
         Self {
-            _marker: PhantomData,
+            _non_send: PhantomData,
         }
     }
 }
@@ -139,13 +139,4 @@ unsafe impl Allocator for LocalAlloc {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_send() {
-        let mut v = Vec::new_in(LocalAlloc::new());
-        v.push(3i32);
-        std::thread::spawn(move || {
-            v.push(2i32);
-        });
-    }
 }
