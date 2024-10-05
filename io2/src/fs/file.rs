@@ -301,9 +301,10 @@ impl LocalCString {
     fn from_path(path: &Path) -> Self {
         let path_ref = path.as_os_str().as_bytes();
         let mut path = Vec::with_capacity_in(path_ref.len() + 1, LocalAlloc::new());
+        // Safety: this is safe because next lines can't panic, and we write up to the new length.
+        unsafe { path.set_len(path_ref.len() + 1) };
         path[..path_ref.len()].copy_from_slice(path_ref);
         path[path_ref.len()] = b'\0';
-        unsafe { path.set_len(path_ref.len() + 1) };
 
         Self { path }
     }

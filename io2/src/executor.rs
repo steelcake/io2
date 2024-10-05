@@ -39,6 +39,7 @@ pub struct CurrentTaskContext {
     to_notify: *mut ToNotify,
 }
 
+// This is to clear data in CURRENT_TASK_CONTEXT in case one of the tasks panic while getting polled
 struct CurrentTaskContextGuard;
 
 impl Drop for CurrentTaskContextGuard {
