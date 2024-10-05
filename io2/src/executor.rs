@@ -14,10 +14,7 @@ use hashbrown::{HashMap, HashSet};
 use io_uring::{cqueue, opcode, squeue, types::Fd, IoUring};
 use nohash_hasher::BuildNoHashHasher;
 
-use crate::{
-    local_alloc::LocalAlloc,
-    slab::Slab,
-};
+use crate::{local_alloc::LocalAlloc, slab::Slab};
 
 thread_local! {
     pub static CURRENT_TASK_CONTEXT: RefCell<Option<CurrentTaskContext>> = const { RefCell::new(None) };
@@ -41,6 +38,16 @@ pub struct CurrentTaskContext {
     block_device_infos: *mut BlockDeviceInfos,
     io: *mut Slab<usize, DynAllocator>,
     to_notify: *mut ToNotify,
+}
+
+struct CurrentTaskContextGuard;
+
+impl Drop for CurrentTaskContextGuard {
+    fn drop(&mut self) {
+        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+            std::mem::drop(ctx.take());
+        });
+    }
 }
 
 impl CurrentTaskContext {
@@ -171,6 +178,10 @@ fn run<T, F: Future<Output = T>>(
     preempt_duration: Duration,
     future: F,
 ) -> io::Result<T> {
+    // This is to cleanup the thread local variable if there is a panic.
+    // It makes sure we are panic/unwind safe.
+    let _ = CurrentTaskContextGuard;
+
     let mut out = Option::<T>::None;
     let out_ptr = &mut out as *mut Option<T>;
     let task = Box::pin_in(
@@ -199,9 +210,13 @@ fn run<T, F: Future<Output = T>>(
     let mut io = Slab::<usize, DynAllocator>::with_capacity_in(128, LocalAlloc::new());
     let mut yielded_tasks = Vec::<usize, DynAllocator>::with_capacity_in(16, LocalAlloc::new());
     let mut tasks_to_yield = Vec::<usize, DynAllocator>::with_capacity_in(16, LocalAlloc::new());
-    let mut io_queue = VecDeque::<squeue::Entry, DynAllocator>::with_capacity_in(128, LocalAlloc::new());
-    let mut block_device_infos =
-        BlockDeviceInfos::with_capacity_and_hasher_in(16, BuildNoHashHasher::default(), LocalAlloc::new());
+    let mut io_queue =
+        VecDeque::<squeue::Entry, DynAllocator>::with_capacity_in(128, LocalAlloc::new());
+    let mut block_device_infos = BlockDeviceInfos::with_capacity_and_hasher_in(
+        16,
+        BuildNoHashHasher::default(),
+        LocalAlloc::new(),
+    );
     let mut io_results = IoResults::with_capacity_and_hasher_in(
         usize::try_from(ring_depth).unwrap() * 4,
         BuildNoHashHasher::default(),
