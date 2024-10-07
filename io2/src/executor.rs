@@ -26,14 +26,13 @@ type BlockDeviceInfos = HashMap<u32, BlockDeviceInfo, BuildNoHashHasher<u32>, Lo
 type ToNotify = HashSet<usize, BuildNoHashHasher<usize>, LocalAlloc>;
 type Task = Pin<Box<dyn Future<Output = ()>, LocalAlloc>>;
 
-pub struct CurrentTaskContext {
+pub(crate) struct CurrentTaskContext {
     start: Instant,
     task_id: usize,
     tasks: *mut Slab<Task, LocalAlloc>,
     io_results: *mut IoResults,
     io_queue: *mut VecDeque<squeue::Entry, LocalAlloc>,
     preempt_duration: Duration,
-    tasks_to_yield: *mut Vec<usize, LocalAlloc>,
     block_device_infos: *mut BlockDeviceInfos,
     io: *mut Slab<usize, LocalAlloc>,
     to_notify: *mut ToNotify,
@@ -85,7 +84,7 @@ impl CurrentTaskContext {
         if self.start.elapsed() < self.preempt_duration {
             false
         } else {
-            unsafe { (*self.tasks_to_yield).push(self.task_id) };
+            unsafe { (*self.to_notify).insert(self.task_id) };
             true
         }
     }
@@ -180,6 +179,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 ) -> io::Result<T> {
     // This is to cleanup the thread local variable if there is a panic.
     // It makes sure we are panic/unwind safe.
+    // If we don't set CURRENT_TASK_CONTEXT to none on panic using this, it will have dangling pointers which will cause memory unsafety.
     let _current_task_context_guard = CurrentTaskContextGuard;
 
     let mut out = Option::<T>::None;
@@ -205,8 +205,6 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 
     let mut tasks = Slab::<Task, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
     let mut io = Slab::<usize, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
-    let mut yielded_tasks = Vec::<usize, LocalAlloc>::with_capacity_in(16, LocalAlloc::new());
-    let mut tasks_to_yield = Vec::<usize, LocalAlloc>::with_capacity_in(16, LocalAlloc::new());
     let mut io_queue =
         VecDeque::<squeue::Entry, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
     let mut block_device_infos = BlockDeviceInfos::with_capacity_and_hasher_in(
@@ -231,10 +229,10 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     to_notify.insert(task_id);
 
     while out.is_none() || files_closing > 0 || FILES_TO_CLOSE.with_borrow(|x| !x.is_empty()) {
-        // poll yielded tasks
-        yielded_tasks.clear();
-        yielded_tasks.extend(tasks_to_yield.iter().copied());
-        for &task_id in yielded_tasks.iter() {
+        // run notified tasks
+        notifying.clear();
+        notifying.extend(to_notify.iter().copied());
+        for &task_id in notifying.iter() {
             CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                 *ctx = Some(CurrentTaskContext {
                     start: Instant::now(),
@@ -247,16 +245,21 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                     io_results: &mut io_results,
                     io_queue: &mut io_queue,
                     preempt_duration,
-                    tasks_to_yield: &mut tasks_to_yield,
                     block_device_infos: &mut block_device_infos,
                     io: &mut io,
                     to_notify: &mut to_notify,
                 });
             });
-            let poll_result = tasks.get_mut(task_id).unwrap().as_mut().poll(&mut poll_ctx);
+            let poll_result = tasks
+                .get_mut(task_id)
+                .map(|task| task.as_mut().poll(&mut poll_ctx));
             CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                 let _ = ctx.take().unwrap();
             });
+            let poll_result = match poll_result {
+                Some(p) => p,
+                None => continue,
+            };
             match poll_result {
                 Poll::Pending => {}
                 Poll::Ready(_) => {
@@ -313,46 +316,6 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
             let task_id = *io.get(io_id).unwrap();
             io_results.insert(io_id, cqe.result());
             to_notify.insert(task_id);
-        }
-
-        // poll tasks with finished io
-        notifying.clear();
-        notifying.extend(to_notify.iter().copied());
-        for &task_id in notifying.iter() {
-            CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
-                *ctx = Some(CurrentTaskContext {
-                    start: Instant::now(),
-                    task_id,
-                    // This is safe because slab contains only pointers to actual tasks,
-                    // we take a pointer and execute our task through it.
-                    // Even if the running tasks spawn another task and the pointer of the running task moves in the slab,
-                    // the actual task doesn't move.
-                    tasks: &mut tasks,
-                    io_results: &mut io_results,
-                    io_queue: &mut io_queue,
-                    preempt_duration,
-                    tasks_to_yield: &mut tasks_to_yield,
-                    block_device_infos: &mut block_device_infos,
-                    io: &mut io,
-                    to_notify: &mut to_notify,
-                });
-            });
-            let poll_result = tasks
-                .get_mut(task_id)
-                .map(|task| task.as_mut().poll(&mut poll_ctx));
-            CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
-                let _ = ctx.take().unwrap();
-            });
-            let poll_result = match poll_result {
-                Some(p) => p,
-                None => continue,
-            };
-            match poll_result {
-                Poll::Pending => {}
-                Poll::Ready(_) => {
-                    std::mem::drop(tasks.remove(task_id));
-                }
-            }
         }
 
         // close files

@@ -9,7 +9,7 @@ pub struct DmaFile {
 impl DmaFile {
     pub async fn open(path: &Path, flags: i32, mode: i32) -> io::Result<DmaFile> {
         Ok(DmaFile {
-            file: File::open(path, flags, mode)?.await?,
+            file: File::open(path, flags | libc::O_DIRECT, mode)?.await?,
         })
     }
 
