@@ -268,7 +268,6 @@ unsafe fn alloc_1gb_explicit(size: usize) -> io::Result<NonNull<[u8]>> {
 }
 
 unsafe fn malloc_wrapper(len: usize, huge_page_flag: libc::c_int) -> io::Result<NonNull<[u8]>> {
-    dbg!(len);
     match libc::mmap(
         std::ptr::null_mut(),
         len,
@@ -323,4 +322,25 @@ const HUGE_PAGE_SIZE_ENV_VAR_NAME: &str = "LOCAL_ALLOC_HUGE_PAGE_SIZE";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore]
+    fn check_thp_allocation() {
+        // Run this and execute `grep -i huge /proc/meminfo` in a terminal to see if it is really allocating anon(transparent) huge pages
+        // Kernel doesn't really allocate all of this memory or it doesn't make all of it hugepages which is normal. It should at least allocate some.
+        let mut ptrs = Vec::new();
+        for _ in 0..100 {
+            ptrs.push(unsafe { alloc_2mb(16 * 1024 * 1024).unwrap() });
+        }
+        // touch some memory so it allocates more
+        for p in ptrs.iter_mut() {
+            unsafe {
+                *p.as_mut().as_mut_ptr().add(1024 * 1024 * 16 - 1) = 31;
+            };
+            unsafe {
+                *p.as_mut().as_mut_ptr().add(1024 * 1024 * 12 - 1) = 31;
+            };
+        }
+        loop {}
+    }
 }
