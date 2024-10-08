@@ -182,7 +182,17 @@ unsafe impl Allocator for LocalAlloc {
 
 unsafe fn alloc_2mb(size: usize) -> io::Result<NonNull<[u8]>> {
     let size = size.next_multiple_of(TWO_MB);
-    alloc(size, 0)
+    let mut ptr = std::ptr::null_mut();
+    match libc::posix_memalign(&mut ptr, TWO_MB, size) {
+        0 => Ok(NonNull::slice_from_raw_parts(
+            NonNull::new(ptr as *mut u8).unwrap(),
+            size,
+        )),
+        err => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("posix_memalign returned error: {}", err),
+        )),
+    }
 }
 
 unsafe fn alloc_2mb_explicit(size: usize) -> io::Result<NonNull<[u8]>> {
