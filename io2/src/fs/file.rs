@@ -210,7 +210,7 @@ impl<'file, 'buf> Future for Write<'file, 'buf> {
 }
 
 pin_project! {
-    struct Statx<'file> {
+    pub(crate) struct Statx<'file> {
         file: &'file File,
         io_id: Option<usize>,
         #[pin] statx: libc::statx,
@@ -385,7 +385,7 @@ impl File {
         }
     }
 
-    fn statx(&self) -> Statx<'_> {
+    pub(crate) fn statx(&self) -> Statx<'_> {
         Statx {
             file: self,
             io_id: None,
