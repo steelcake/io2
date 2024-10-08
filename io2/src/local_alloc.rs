@@ -1,25 +1,68 @@
 use std::{
     alloc::{AllocError, Allocator, Layout},
     cell::RefCell,
+    io,
     marker::PhantomData,
     ptr::NonNull,
 };
 
+use arrayvec::ArrayVec;
+
 thread_local! {
-    static PAGES: RefCell<Vec<Page>> = RefCell::new(Vec::with_capacity(256));
+    static STATE: RefCell<State> = RefCell::new(State::new());
 }
 
-const ALIGN: usize = 2 * 1024 * 1024;
+struct State {
+    alloc: unsafe fn(size: usize) -> io::Result<NonNull<[u8]>>,
+    // TODO: do allocation of these vectors with a good strategy instead of using global allocator
+    pages: Vec<Page>,
+    free_list: Vec<Vec<FreeRange>>,
+}
 
+impl State {
+    fn new() -> Self {
+        let alloc = match std::env::var(HUGE_PAGE_SIZE_ENV_VAR_NAME) {
+            Err(e) => {
+                log::trace!("failed to read {} from environment: {}\nDefaulting using regular 2MB aligned allocations", HUGE_PAGE_SIZE_ENV_VAR_NAME, e);
+                alloc_2mb
+            }
+            Ok(huge_page_size) => match huge_page_size.as_str() {
+                "2MB" => {
+                    log::trace!("using explicit 2MB huge pages");
+                    alloc_2mb_explicit
+                }
+                "1GB" => {
+                    log::trace!("using explicit 1GB huge pages");
+                    alloc_1gb_explicit
+                }
+                _ => {
+                    log::trace!(
+                        "unknown value read from {} in environment: {}. Expected 2MB or 1GB.\nDefaulting using regular 2MB aligned allocations",
+                        HUGE_PAGE_SIZE_ENV_VAR_NAME,
+                        huge_page_size
+                    );
+                    alloc_2mb
+                }
+            },
+        };
+
+        Self {
+            alloc,
+            pages: Vec::with_capacity(128),
+            free_list: Vec::with_capacity(128),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Page {
     ptr: *mut u8,
-    layout: Layout,
-    free_list: Vec<FreeRange>,
+    size: usize,
 }
 
 #[derive(Clone, Copy)]
 struct FreeRange {
-    start: usize,
+    start: *mut u8,
     len: usize,
 }
 
@@ -29,6 +72,7 @@ pub struct LocalAlloc {
 }
 
 impl LocalAlloc {
+    #[inline(always)]
     pub fn new() -> Self {
         Self {
             _non_send: PhantomData,
@@ -38,105 +82,265 @@ impl LocalAlloc {
 
 unsafe impl Allocator for LocalAlloc {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        PAGES.with_borrow_mut(|pages| {
-            for page in pages.iter_mut() {
-                let mut alloc = None;
-                for (page_idx, range) in page.free_list.iter().enumerate() {
-                    let alloc_start =
-                        (page.ptr as usize + range.start).next_multiple_of(layout.align());
-                    let alloc_start = alloc_start - page.ptr as usize;
-                    if alloc_start + layout.size() > range.start + range.len {
-                        continue;
-                    }
+        if layout.align() > TWO_MB {
+            return Err(AllocError);
+        }
 
-                    alloc = Some((page_idx, alloc_start));
-                    break;
+        STATE.with_borrow_mut(|state| {
+            for free_ranges in state.free_list.iter_mut() {
+                let mut found = None;
+                for (idx, range) in free_ranges.iter_mut().enumerate() {
+                    let start = range.start.align_offset(layout.align());
+                    if range.len >= start + layout.size() {
+                        if start == 0 && layout.size() == range.len {
+                            found = Some((
+                                idx,
+                                NonNull::slice_from_raw_parts(
+                                    NonNull::new(range.start).unwrap(),
+                                    layout.size(),
+                                ),
+                                ArrayVec::<FreeRange, 2>::new(),
+                            ));
+                        } else {
+                            let mut new_ranges = ArrayVec::<FreeRange, 2>::new();
+                            unsafe {
+                                if start == 0 {
+                                    new_ranges.push(FreeRange {
+                                        start: range.start.add(layout.size()),
+                                        len: range.len - layout.size(),
+                                    });
+                                } else {
+                                    new_ranges.push(FreeRange {
+                                        start: range.start.add(start),
+                                        len: start,
+                                    });
+                                    if start + layout.size() < range.len {
+                                        let offset = start + layout.size();
+                                        new_ranges.push(FreeRange {
+                                            start: range.start.add(offset),
+                                            len: range.len - offset,
+                                        });
+                                    }
+                                }
+                            }
+                            found = Some((
+                                idx,
+                                NonNull::slice_from_raw_parts(
+                                    unsafe { NonNull::new(range.start.add(start)).unwrap() },
+                                    layout.size(),
+                                ),
+                                new_ranges,
+                            ));
+                        }
+
+                        break;
+                    }
                 }
-
-                if let Some(alloc) = alloc {
-                    let mut range = *page.free_list.get(alloc.0).unwrap();
-                    if alloc.1 == range.start {
-                        range.start += layout.size();
-                        range.len -= layout.size();
-                    } else {
-                        let new_len = alloc.1 - range.start;
-                        page.free_list.push(FreeRange {
-                            start: alloc.1 + layout.size(),
-                            len: range.len - new_len - layout.size(),
-                        });
-                        range.len = new_len;
-                    }
-                    page.free_list[alloc.0] = range;
-
-                    unsafe {
-                        return Ok(NonNull::new_unchecked(std::ptr::slice_from_raw_parts_mut(
-                            page.ptr.add(alloc.1),
-                            layout.size(),
-                        )));
-                    }
+                if let Some((idx, allocated_slice, new_ranges)) = found {
+                    free_ranges.swap_remove(idx);
+                    free_ranges.extend_from_slice(&new_ranges);
+                    return Ok(allocated_slice);
                 }
             }
 
-            let align = ALIGN.next_multiple_of(layout.align());
-            let size = ALIGN.next_multiple_of(layout.size());
-            let page_layout = Layout::from_size_align(size, align).unwrap();
-            let ptr = unsafe { std::alloc::alloc(page_layout) };
-            let mut free_list = Vec::with_capacity(32);
-            free_list.push(FreeRange {
-                start: layout.size(),
-                len: size - layout.size(),
-            });
+            let page = unsafe {
+                match (state.alloc)(layout.size()) {
+                    Ok(mut page) => page.as_mut(),
+                    Err(e) => {
+                        log::trace!("failed to allocate a page: {}", e);
+                        return Err(AllocError);
+                    }
+                }
+            };
+            let page = Page {
+                ptr: page.as_mut_ptr(),
+                size: page.len(),
+            };
+            let free_range = FreeRange {
+                start: unsafe { page.ptr.add(layout.size()) },
+                len: page.size.checked_sub(layout.size()).unwrap(),
+            };
+            let mut free_ranges = Vec::with_capacity(16);
+            free_ranges.push(free_range);
 
-            pages.push(Page {
-                ptr,
-                layout: page_layout,
-                free_list,
-            });
+            state.pages.push(page);
+            state.free_list.push(free_ranges);
 
-            unsafe {
-                Ok(NonNull::new_unchecked(std::ptr::slice_from_raw_parts_mut(
-                    ptr,
-                    layout.size(),
-                )))
-            }
+            Ok(NonNull::slice_from_raw_parts(
+                NonNull::new(page.ptr).unwrap(),
+                layout.size(),
+            ))
         })
     }
 
-    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: Layout) {
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         let ptr = ptr.as_ptr();
-        PAGES.with_borrow_mut(|pages| {
-            for page in pages.iter_mut() {
-                if page.ptr <= ptr && page.ptr.add(page.layout.size()) >= ptr.add(layout.size()) {
-                    let start = ptr.sub(page.ptr as usize) as usize;
-                    let end = start + layout.size();
-                    let mut found = false;
-                    dbg!((start, end, page.layout.size()));
-                    for range in page.free_list.iter_mut() {
-                        if start == range.start + range.len {
-                            range.len += layout.size();
-                            found = true;
-                        } else if end == range.start {
-                            range.start -= layout.size();
-                            found = true;
-                        }
-                    }
-                    if !found {
-                        page.free_list.push(FreeRange {
-                            start: start,
-                            len: layout.size(),
-                        });
-                    }
+        let size = layout.size();
+        let end_ptr = ptr.add(size.checked_add(1).unwrap());
 
-                    return;
+        STATE.with_borrow_mut(|state| {
+            let (page_idx, &page) = state
+                .pages
+                .iter()
+                .enumerate()
+                .find(|(_, page)| page.ptr <= ptr && page.ptr.add(page.size) >= ptr.add(size))
+                .expect("bad deallocate, couldn't find the page that contains this allocation");
+            let free_ranges = state.free_list.get_mut(page_idx).unwrap();
+
+            let mut found = false;
+            for free in free_ranges.iter_mut() {
+                if free.start == end_ptr {
+                    free.start = ptr;
+                    free.len += size;
+                    found = true;
+                }
+
+                if free.start.add(free.len.checked_add(1).unwrap()) == ptr {
+                    free.len += size;
+                    found = true;
                 }
             }
 
-            panic!("bad deallocate");
+            if !found {
+                free_ranges.push(FreeRange {
+                    start: ptr,
+                    len: size,
+                });
+            }
+
+            if free_ranges.len() == 1 {
+                let range = free_ranges.first().unwrap();
+                if range.start == page.ptr && range.len == page.size {
+                    state.pages.swap_remove(page_idx);
+                    state.free_list.swap_remove(page_idx);
+                    unsafe { free(page.ptr, page.size).expect("free a page") };
+                }
+            }
         })
     }
 }
 
+unsafe fn alloc_2mb(size: usize) -> io::Result<NonNull<[u8]>> {
+    let size = size.next_multiple_of(TWO_MB);
+    let mut ptr = std::ptr::null_mut();
+    match libc::posix_memalign(&mut ptr, TWO_MB, size) {
+        0 => {
+            match libc::madvise(ptr, size, libc::MADV_HUGEPAGE) {
+                0 => (),
+                -1 => {
+                    let errno = *libc::__errno_location();
+                    let err = std::io::Error::from_raw_os_error(errno);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("failed to madvise: {}", err),
+                    ));
+                }
+                x => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "unexpected return value from madvise: {}. Expected 0 or -1",
+                            x
+                        ),
+                    ));
+                }
+            }
+            Ok(NonNull::slice_from_raw_parts(
+                NonNull::new(ptr as *mut u8).unwrap(),
+                size,
+            ))
+        }
+        err => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("posix_memalign returned error: {}", err),
+        )),
+    }
+}
+
+unsafe fn alloc_2mb_explicit(size: usize) -> io::Result<NonNull<[u8]>> {
+    let size = size.next_multiple_of(TWO_MB);
+    malloc_wrapper(size, libc::MAP_HUGE_2MB | libc::MAP_HUGETLB)
+}
+
+unsafe fn alloc_1gb_explicit(size: usize) -> io::Result<NonNull<[u8]>> {
+    let size = size.next_multiple_of(ONE_GB);
+    malloc_wrapper(size, libc::MAP_HUGE_1GB | libc::MAP_HUGETLB)
+}
+
+unsafe fn malloc_wrapper(len: usize, huge_page_flag: libc::c_int) -> io::Result<NonNull<[u8]>> {
+    match libc::mmap(
+        std::ptr::null_mut(),
+        len,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | huge_page_flag,
+        -1,
+        0,
+    ) {
+        libc::MAP_FAILED => {
+            let errno = *libc::__errno_location();
+            let err = std::io::Error::from_raw_os_error(errno);
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("mmap returned error: {}", err),
+            ))
+        }
+        ptr => match NonNull::new(ptr as *mut u8) {
+            Some(ptr) => Ok(NonNull::slice_from_raw_parts(ptr, len)),
+            None => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "mmap returned null pointer",
+            )),
+        },
+    }
+}
+
+unsafe fn free(ptr: *mut u8, length: usize) -> io::Result<()> {
+    match libc::munmap(ptr as *mut libc::c_void, length) {
+        0 => Ok(()),
+        -1 => {
+            let errno = *libc::__errno_location();
+            let err = std::io::Error::from_raw_os_error(errno);
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to free memory: {}", err),
+            ))
+        }
+        x => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "unexpected return value from munmap: {}. Expected 0 or -1",
+                x
+            ),
+        )),
+    }
+}
+
+const ONE_GB: usize = 1024 * 1024 * 1024;
+const TWO_MB: usize = 2 * 1024 * 1024;
+const HUGE_PAGE_SIZE_ENV_VAR_NAME: &str = "LOCAL_ALLOC_HUGE_PAGE_SIZE";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore]
+    fn check_thp_allocation() {
+        // Run this and execute `grep -i huge /proc/meminfo` in a terminal to see if it is really allocating anon(transparent) huge pages
+        // Kernel doesn't really allocate all of this memory or it doesn't make all of it hugepages which is normal. It should at least allocate some.
+        let mut ptrs = Vec::new();
+        for _ in 0..100 {
+            ptrs.push(unsafe { alloc_2mb(16 * 1024 * 1024).unwrap() });
+        }
+        // touch some memory so it allocates more
+        for p in ptrs.iter_mut() {
+            unsafe {
+                *p.as_mut().as_mut_ptr().add(1024 * 1024 * 16 - 1) = 31;
+            };
+            unsafe {
+                *p.as_mut().as_mut_ptr().add(1024 * 1024 * 12 - 1) = 31;
+            };
+        }
+        loop {}
+    }
 }

@@ -404,7 +404,10 @@ mod tests {
                     YieldIfNeeded.await;
                 }
 
-                let handle1 = spawn(async { 1 });
+                let handle1 = spawn(async {
+                    YieldIfNeeded.await;
+                    1
+                });
 
                 YieldIfNeeded.await;
 
