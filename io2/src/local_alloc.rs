@@ -224,10 +224,32 @@ unsafe fn alloc_2mb(size: usize) -> io::Result<NonNull<[u8]>> {
     let size = size.next_multiple_of(TWO_MB);
     let mut ptr = std::ptr::null_mut();
     match libc::posix_memalign(&mut ptr, TWO_MB, size) {
-        0 => Ok(NonNull::slice_from_raw_parts(
-            NonNull::new(ptr as *mut u8).unwrap(),
-            size,
-        )),
+        0 => {
+            match libc::madvise(ptr, size, libc::MADV_HUGEPAGE) {
+                0 => (),
+                -1 => {
+                    let errno = *libc::__errno_location();
+                    let err = std::io::Error::from_raw_os_error(errno);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("failed to madvise: {}", err),
+                    ));
+                }
+                x => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "unexpected return value from madvise: {}. Expected 0 or -1",
+                            x
+                        ),
+                    ));
+                }
+            }
+            Ok(NonNull::slice_from_raw_parts(
+                NonNull::new(ptr as *mut u8).unwrap(),
+                size,
+            ))
+        }
         err => Err(io::Error::new(
             io::ErrorKind::Other,
             format!("posix_memalign returned error: {}", err),
