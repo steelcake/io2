@@ -85,33 +85,33 @@ unsafe impl Allocator for LocalAlloc {
         }
 
         STATE.with_borrow_mut(|state| {
-            for free_ranges in state.free_list.iter_mut() {
-                let mut found = None;
-                for (idx, range) in free_ranges.iter_mut().enumerate() {
-                    let start = range.start.align_offset(layout.align());
-                    if range.len >= start + layout.size() {
-                        if start == 0 && layout.size() == range.len {
-                            found = Some((
-                                idx,
-                                NonNull::slice_from_raw_parts(
-                                    NonNull::new(range.start).unwrap(),
-                                    range.len,
-                                ),
-                            ));
-                        } else {
-                            found = Some((idx,));
-                        }
+            // for free_ranges in state.free_list.iter_mut() {
+            //     let mut found = None;
+            //     for (idx, range) in free_ranges.iter_mut().enumerate() {
+            //         let start = range.start.align_offset(layout.align());
+            //         if range.len >= start + layout.size() {
+            //             if start == 0 && layout.size() == range.len {
+            //                 found = Some((
+            //                     idx,
+            //                     NonNull::slice_from_raw_parts(
+            //                         NonNull::new(range.start).unwrap(),
+            //                         range.len,
+            //                     ),
+            //                 ));
+            //             } else {
+            //                 found = Some((idx,));
+            //             }
 
-                        break;
-                    }
-                }
-                if let Some(idx) = delete_idx {
-                    free_ranges.swap_remove(idx);
-                }
-                if let Some(slice) = slice {
-                    return Ok(slice);
-                }
-            }
+            //             break;
+            //         }
+            //     }
+            //     if let Some(idx) = delete_idx {
+            //         free_ranges.swap_remove(idx);
+            //     }
+            //     if let Some(slice) = slice {
+            //         return Ok(slice);
+            //     }
+            // }
 
             let page = unsafe {
                 match (state.alloc)(layout.size()) {
@@ -126,10 +126,20 @@ unsafe impl Allocator for LocalAlloc {
                 ptr: page.as_mut_ptr(),
                 size: page.len(),
             };
+            let free_range = FreeRange {
+                start: unsafe { page.ptr.add(layout.size()) },
+                len: page.size.checked_sub(layout.size()).unwrap(),
+            };
+            let mut free_ranges = Vec::with_capacity(16);
+            free_ranges.push(free_range);
 
-            let start = page.ptr;
+            state.pages.push(page);
+            state.free_list.push(free_ranges);
 
-            todo!()
+            Ok(NonNull::slice_from_raw_parts(
+                NonNull::new(page.ptr).unwrap(),
+                layout.size(),
+            ))
         })
     }
 
