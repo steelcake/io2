@@ -7,7 +7,7 @@ use std::{
 };
 
 thread_local! {
-    static PAGES: RefCell<State> = RefCell::new(State::new());
+    static STATE: RefCell<State> = RefCell::new(State::new());
 }
 
 struct State {
@@ -60,7 +60,7 @@ struct Page {
 
 #[derive(Clone, Copy)]
 struct FreeRange {
-    start: usize,
+    start: *mut u8,
     len: usize,
 }
 
@@ -81,14 +81,102 @@ impl LocalAlloc {
 unsafe impl Allocator for LocalAlloc {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         if layout.align() > TWO_MB {
-            panic!("alignment can't be bigger than 2MB");
+            return Err(AllocError);
         }
 
-        todo!()
+        STATE.with_borrow_mut(|state| {
+            for free_ranges in state.free_list.iter_mut() {
+                let mut found = None;
+                for (idx, range) in free_ranges.iter_mut().enumerate() {
+                    let start = range.start.align_offset(layout.align());
+                    if range.len >= start + layout.size() {
+                        if start == 0 && layout.size() == range.len {
+                            found = Some((
+                                idx,
+                                NonNull::slice_from_raw_parts(
+                                    NonNull::new(range.start).unwrap(),
+                                    range.len,
+                                ),
+                            ));
+                        } else {
+                            found = Some((idx,));
+                        }
+
+                        break;
+                    }
+                }
+                if let Some(idx) = delete_idx {
+                    free_ranges.swap_remove(idx);
+                }
+                if let Some(slice) = slice {
+                    return Ok(slice);
+                }
+            }
+
+            let page = unsafe {
+                match (state.alloc)(layout.size()) {
+                    Ok(mut page) => page.as_mut(),
+                    Err(e) => {
+                        log::trace!("failed to allocate a page: {}", e);
+                        return Err(AllocError);
+                    }
+                }
+            };
+            let page = Page {
+                ptr: page.as_mut_ptr(),
+                size: page.len(),
+            };
+
+            let start = page.ptr;
+
+            todo!()
+        })
     }
 
-    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: Layout) {
-        todo!()
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        let ptr = ptr.as_ptr();
+        let size = layout.size();
+        let end_ptr = ptr.add(size.checked_add(1).unwrap());
+
+        STATE.with_borrow_mut(|state| {
+            let (page_idx, &page) = state
+                .pages
+                .iter()
+                .enumerate()
+                .find(|(_, page)| page.ptr <= ptr && page.ptr.add(page.size) >= ptr.add(size))
+                .expect("bad deallocate, couldn't find the page that contains this allocation");
+            let free_ranges = state.free_list.get_mut(page_idx).unwrap();
+
+            let mut found = false;
+            for free in free_ranges.iter_mut() {
+                if free.start == end_ptr {
+                    free.start = ptr;
+                    free.len += size;
+                    found = true;
+                }
+
+                if free.start.add(free.len.checked_add(1).unwrap()) == ptr {
+                    free.len += size;
+                    found = true;
+                }
+            }
+
+            if !found {
+                free_ranges.push(FreeRange {
+                    start: ptr,
+                    len: size,
+                });
+            }
+
+            if free_ranges.len() == 1 {
+                let range = free_ranges.first().unwrap();
+                if range.start == page.ptr && range.len == page.size {
+                    state.pages.swap_remove(page_idx);
+                    state.free_list.swap_remove(page_idx);
+                    unsafe { free(page.ptr, page.size).expect("free a page") };
+                }
+            }
+        })
     }
 }
 
