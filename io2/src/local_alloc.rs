@@ -6,6 +6,8 @@ use std::{
     ptr::NonNull,
 };
 
+use arrayvec::ArrayVec;
+
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::new());
 }
@@ -85,33 +87,61 @@ unsafe impl Allocator for LocalAlloc {
         }
 
         STATE.with_borrow_mut(|state| {
-            // for free_ranges in state.free_list.iter_mut() {
-            //     let mut found = None;
-            //     for (idx, range) in free_ranges.iter_mut().enumerate() {
-            //         let start = range.start.align_offset(layout.align());
-            //         if range.len >= start + layout.size() {
-            //             if start == 0 && layout.size() == range.len {
-            //                 found = Some((
-            //                     idx,
-            //                     NonNull::slice_from_raw_parts(
-            //                         NonNull::new(range.start).unwrap(),
-            //                         range.len,
-            //                     ),
-            //                 ));
-            //             } else {
-            //                 found = Some((idx,));
-            //             }
+            for free_ranges in state.free_list.iter_mut() {
+                let mut found = None;
+                for (idx, range) in free_ranges.iter_mut().enumerate() {
+                    let start = range.start.align_offset(layout.align());
+                    if range.len >= start + layout.size() {
+                        if start == 0 && layout.size() == range.len {
+                            found = Some((
+                                idx,
+                                NonNull::slice_from_raw_parts(
+                                    NonNull::new(range.start).unwrap(),
+                                    layout.size(),
+                                ),
+                                ArrayVec::<FreeRange, 2>::new(),
+                            ));
+                        } else {
+                            let mut new_ranges = ArrayVec::<FreeRange, 2>::new();
+                            unsafe {
+                                if start == 0 {
+                                    new_ranges.push(FreeRange {
+                                        start: range.start.add(layout.size()),
+                                        len: range.len - layout.size(),
+                                    });
+                                } else {
+                                    new_ranges.push(FreeRange {
+                                        start: range.start.add(start),
+                                        len: start,
+                                    });
+                                    if start + layout.size() < range.len {
+                                        let offset = start + layout.size();
+                                        new_ranges.push(FreeRange {
+                                            start: range.start.add(offset),
+                                            len: range.len - offset,
+                                        });
+                                    }
+                                }
+                            }
+                            found = Some((
+                                idx,
+                                NonNull::slice_from_raw_parts(
+                                    unsafe { NonNull::new(range.start.add(start)).unwrap() },
+                                    layout.size(),
+                                ),
+                                new_ranges,
+                            ));
+                        }
 
-            //             break;
-            //         }
-            //     }
-            //     if let Some(idx) = delete_idx {
-            //         free_ranges.swap_remove(idx);
-            //     }
-            //     if let Some(slice) = slice {
-            //         return Ok(slice);
-            //     }
-            // }
+                        break;
+                    }
+                }
+                if let Some((idx, allocated_slice, new_ranges)) = found {
+                    free_ranges.swap_remove(idx);
+                    free_ranges.extend_from_slice(&new_ranges);
+                    return Ok(allocated_slice);
+                }
+            }
 
             let page = unsafe {
                 match (state.alloc)(layout.size()) {
@@ -207,15 +237,16 @@ unsafe fn alloc_2mb(size: usize) -> io::Result<NonNull<[u8]>> {
 
 unsafe fn alloc_2mb_explicit(size: usize) -> io::Result<NonNull<[u8]>> {
     let size = size.next_multiple_of(TWO_MB);
-    alloc(size, libc::MAP_HUGE_2MB)
+    malloc_wrapper(size, libc::MAP_HUGE_2MB | libc::MAP_HUGETLB)
 }
 
 unsafe fn alloc_1gb_explicit(size: usize) -> io::Result<NonNull<[u8]>> {
     let size = size.next_multiple_of(ONE_GB);
-    alloc(size, libc::MAP_HUGE_1GB)
+    malloc_wrapper(size, libc::MAP_HUGE_1GB | libc::MAP_HUGETLB)
 }
 
-unsafe fn alloc(len: usize, huge_page_flag: libc::c_int) -> io::Result<NonNull<[u8]>> {
+unsafe fn malloc_wrapper(len: usize, huge_page_flag: libc::c_int) -> io::Result<NonNull<[u8]>> {
+    dbg!(len);
     match libc::mmap(
         std::ptr::null_mut(),
         len,

@@ -11,3 +11,4 @@ nohash-hasher = "0.2.0"
 pin-project-lite = "0.2"
 hashbrown = { version = "0.14", default-features = false, features = ["nightly"] }
 log = "0.4"
+arrayvec = "0.7"
