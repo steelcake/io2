@@ -13,6 +13,7 @@ use pin_project_lite::pin_project;
 
 use crate::executor::{CURRENT_TASK_CONTEXT, FILES_TO_CLOSE};
 use crate::local_alloc::LocalAlloc;
+use crate::slab;
 
 pub struct File {
     fd: RawFd,
@@ -20,7 +21,7 @@ pub struct File {
 }
 
 pub struct Close {
-    io_id: Option<usize>,
+    io_id: Option<slab::Key>,
     fd: RawFd,
     _non_send: PhantomData<*mut ()>,
 }
@@ -61,7 +62,7 @@ pin_project! {
     pub struct Open {
         path: LocalCString,
         #[pin] how: libc::open_how,
-        io_id: Option<usize>,
+        io_id: Option<slab::Key>,
         _non_send: PhantomData<*mut ()>,
     }
 }
@@ -115,7 +116,7 @@ pub struct Read<'file, 'buf> {
     file: &'file File,
     offset: u64,
     buf: &'buf mut [u8],
-    io_id: Option<usize>,
+    io_id: Option<slab::Key>,
     _non_send: PhantomData<*mut ()>,
 }
 
@@ -164,7 +165,7 @@ pub struct Write<'file, 'buf> {
     file: &'file File,
     offset: u64,
     buf: &'buf [u8],
-    io_id: Option<usize>,
+    io_id: Option<slab::Key>,
     _non_send: PhantomData<*mut ()>,
 }
 
@@ -212,7 +213,7 @@ impl<'file, 'buf> Future for Write<'file, 'buf> {
 pin_project! {
     pub(crate) struct Statx<'file> {
         file: &'file File,
-        io_id: Option<usize>,
+        io_id: Option<slab::Key>,
         #[pin] statx: libc::statx,
         _non_send: PhantomData<*mut ()>,
     }
@@ -267,7 +268,7 @@ impl<'file> Future for Statx<'file> {
 
 pub struct SyncAll<'file> {
     file: &'file File,
-    io_id: Option<usize>,
+    io_id: Option<slab::Key>,
     _non_send: PhantomData<*mut ()>,
 }
 

@@ -10,31 +10,29 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hashbrown::{HashMap, HashSet};
 use io_uring::{cqueue, opcode, squeue, types::Fd, IoUring};
-use nohash_hasher::BuildNoHashHasher;
 
-use crate::{local_alloc::LocalAlloc, slab::Slab};
+use crate::{local_alloc::LocalAlloc, slab, vecmap::VecMap};
 
 thread_local! {
     pub(crate) static CURRENT_TASK_CONTEXT: RefCell<Option<CurrentTaskContext>> = const { RefCell::new(None) };
     pub(crate) static FILES_TO_CLOSE: RefCell<Vec<RawFd>> = RefCell::new(Vec::with_capacity(128));
 }
 
-type IoResults = HashMap<usize, i32, BuildNoHashHasher<usize>, LocalAlloc>;
-type BlockDeviceInfos = HashMap<u32, BlockDeviceInfo, BuildNoHashHasher<u32>, LocalAlloc>;
-type ToNotify = HashSet<usize, BuildNoHashHasher<usize>, LocalAlloc>;
+type IoResults = VecMap<slab::Key, i32, LocalAlloc>;
+type BlockDeviceInfos = VecMap<u32, BlockDeviceInfo, LocalAlloc>;
+type ToNotify = VecMap<slab::Key, (), LocalAlloc>;
 type Task = Pin<Box<dyn Future<Output = ()>, LocalAlloc>>;
 
 pub(crate) struct CurrentTaskContext {
     start: Instant,
-    task_id: usize,
-    tasks: *mut Slab<Task, LocalAlloc>,
+    task_id: slab::Key,
+    tasks: *mut slab::Slab<Task, LocalAlloc>,
     io_results: *mut IoResults,
     io_queue: *mut VecDeque<squeue::Entry, LocalAlloc>,
     preempt_duration: Duration,
     block_device_infos: *mut BlockDeviceInfos,
-    io: *mut Slab<usize, LocalAlloc>,
+    io: *mut slab::Slab<slab::Key, LocalAlloc>,
     to_notify: *mut ToNotify,
 }
 
@@ -50,13 +48,13 @@ impl Drop for CurrentTaskContextGuard {
 }
 
 impl CurrentTaskContext {
-    pub(crate) fn notify(&mut self, task_id: usize) {
+    pub(crate) fn notify(&mut self, task_id: slab::Key) {
         unsafe {
-            (*self.to_notify).insert(task_id);
+            (*self.to_notify).insert(task_id, ());
         }
     }
 
-    pub(crate) fn take_io_result(&mut self, io_id: usize) -> Option<i32> {
+    pub(crate) fn take_io_result(&mut self, io_id: slab::Key) -> Option<i32> {
         unsafe {
             match (*self.io_results).remove(&io_id) {
                 Some(res) => {
@@ -84,7 +82,7 @@ impl CurrentTaskContext {
         if self.start.elapsed() < self.preempt_duration {
             false
         } else {
-            unsafe { (*self.to_notify).insert(self.task_id) };
+            unsafe { (*self.to_notify).insert(self.task_id, ()) };
             true
         }
     }
@@ -118,7 +116,7 @@ impl CurrentTaskContext {
     /// Safety: caller must make sure the squeue entry is valid.
     /// Caller future that queued this IO should not return Poll::Ready until it receives
     /// io completion via take_io_result
-    pub(crate) unsafe fn queue_io(&mut self, entry: squeue::Entry) -> usize {
+    pub(crate) unsafe fn queue_io(&mut self, entry: squeue::Entry) -> slab::Key {
         unsafe {
             let io_id = (*self.io).insert(self.task_id);
             let entry = entry.user_data(io_id.try_into().unwrap());
@@ -203,35 +201,27 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
         .build(ring_depth)?;
     let (submitter, mut sq, mut cq) = ring.split();
 
-    let mut tasks = Slab::<Task, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
-    let mut io = Slab::<usize, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
+    let mut tasks = slab::Slab::<Task, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
+    let mut io = slab::Slab::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
     let mut io_queue =
         VecDeque::<squeue::Entry, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
-    let mut block_device_infos = BlockDeviceInfos::with_capacity_and_hasher_in(
-        16,
-        BuildNoHashHasher::default(),
-        LocalAlloc::new(),
-    );
-    let mut io_results = IoResults::with_capacity_and_hasher_in(
-        usize::try_from(ring_depth).unwrap() * 4,
-        BuildNoHashHasher::default(),
-        LocalAlloc::new(),
-    );
-    let mut to_notify =
-        ToNotify::with_capacity_and_hasher_in(128, BuildNoHashHasher::default(), LocalAlloc::new());
-    let mut notifying = Vec::<usize, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
+    let mut block_device_infos = BlockDeviceInfos::with_capacity_in(16, LocalAlloc::new());
+    let mut io_results =
+        IoResults::with_capacity_in(usize::try_from(ring_depth).unwrap() * 4, LocalAlloc::new());
+    let mut to_notify = ToNotify::with_capacity_in(128, LocalAlloc::new());
+    let mut notifying = Vec::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
 
     let close_file_task_id = tasks.insert(Box::pin_in(async {}, LocalAlloc::new()));
     let close_file_io_id = io.insert(close_file_task_id);
     let mut files_closing = 0usize;
 
     let task_id = tasks.insert(task);
-    to_notify.insert(task_id);
+    to_notify.insert(task_id, ());
 
     while out.is_none() || files_closing > 0 || FILES_TO_CLOSE.with_borrow(|x| !x.is_empty()) {
         // run notified tasks
         notifying.clear();
-        notifying.extend(to_notify.iter().copied());
+        notifying.extend(to_notify.iter().map(|kv| kv.0));
         for &task_id in notifying.iter() {
             CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                 *ctx = Some(CurrentTaskContext {
@@ -308,14 +298,14 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 
         cq.sync();
         for cqe in &mut cq {
-            let io_id = usize::try_from(cqe.user_data()).unwrap();
+            let io_id = slab::Key::try_from(cqe.user_data()).unwrap();
             if io_id == close_file_io_id {
                 files_closing = files_closing.checked_sub(1).unwrap();
                 continue;
             }
             let task_id = *io.get(io_id).unwrap();
             io_results.insert(io_id, cqe.result());
-            to_notify.insert(task_id);
+            to_notify.insert(task_id, ());
         }
 
         // close files

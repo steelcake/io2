@@ -6,8 +6,6 @@ use std::{
     ptr::NonNull,
 };
 
-use arrayvec::ArrayVec;
-
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::new());
 }
@@ -99,24 +97,24 @@ unsafe impl Allocator for LocalAlloc {
                                     NonNull::new(range.start).unwrap(),
                                     layout.size(),
                                 ),
-                                ArrayVec::<FreeRange, 2>::new(),
+                                (None, None),
                             ));
                         } else {
-                            let mut new_ranges = ArrayVec::<FreeRange, 2>::new();
+                            let mut new_ranges = (None, None);
                             unsafe {
                                 if start == 0 {
-                                    new_ranges.push(FreeRange {
+                                    new_ranges.0 = Some(FreeRange {
                                         start: range.start.add(layout.size()),
                                         len: range.len - layout.size(),
                                     });
                                 } else {
-                                    new_ranges.push(FreeRange {
+                                    new_ranges.0 = Some(FreeRange {
                                         start: range.start.add(start),
                                         len: start,
                                     });
                                     if start + layout.size() < range.len {
                                         let offset = start + layout.size();
-                                        new_ranges.push(FreeRange {
+                                        new_ranges.1 = Some(FreeRange {
                                             start: range.start.add(offset),
                                             len: range.len - offset,
                                         });
@@ -138,7 +136,12 @@ unsafe impl Allocator for LocalAlloc {
                 }
                 if let Some((idx, allocated_slice, new_ranges)) = found {
                     free_ranges.swap_remove(idx);
-                    free_ranges.extend_from_slice(&new_ranges);
+                    if let Some(x) = new_ranges.0 {
+                        free_ranges.push(x);
+                    }
+                    if let Some(x) = new_ranges.1 {
+                        free_ranges.push(x);
+                    }
                     return Ok(allocated_slice);
                 }
             }
