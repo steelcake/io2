@@ -51,7 +51,7 @@ impl<T, A: Allocator> Slab<T, A> {
                     val,
                 };
             }
-            _ => unimplemented!(),
+            _ => unreachable!(),
         }
 
         Key {
