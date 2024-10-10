@@ -286,13 +286,13 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                         std::mem::drop(tasks.remove(task_id));
                     }
                 }
+
+                if start.elapsed() > preempt_duration {
+                    break;
+                }
             }
 
             try_submit_io(&mut io_queue, &mut ring);
-
-            if start.elapsed() > preempt_duration {
-                break;
-            }
         }
 
         try_submit_io(&mut io_queue, &mut ring);
