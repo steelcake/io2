@@ -227,13 +227,13 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                 && io_queue.is_empty()
                 && FILES_TO_CLOSE.with_borrow(|x| x.is_empty())
             {
-                while cq.is_empty() {
-                    for _ in 0..6 {
+                'wait: while cq.is_empty() {
+                    for _ in 0..16 {
                         if cq.is_empty() {
-                            break;
-                        } else {
                             cq.sync();
                             std::hint::spin_loop();
+                        } else {
+                            break 'wait;
                         }
                     }
                     // Not sure if this is the best way to do it. It gives more latency than std::thread::yield_now() (apparently should never use yield_now in linux)
