@@ -26,6 +26,7 @@ impl<T, A: Allocator> Slab<T, A> {
         let entry = match self.elems.get_mut(self.first_free_entry) {
             Some(entry) => entry,
             None => {
+                assert_eq!(self.first_free_entry, self.elems.len() + 1);
                 let extend_len = self.elems.len();
                 self.elems.reserve_exact(extend_len);
                 for i in 0..extend_len {
