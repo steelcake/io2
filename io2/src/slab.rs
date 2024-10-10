@@ -8,6 +8,12 @@ pub struct Slab<T, A: Allocator> {
 
 impl<T, A: Allocator> Slab<T, A> {
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+        let capacity = if capacity > 0 {
+            capacity.next_power_of_two()
+        } else {
+            0
+        };
+
         let mut elems = Vec::with_capacity_in(capacity, alloc);
 
         for i in 0..capacity {
@@ -27,8 +33,8 @@ impl<T, A: Allocator> Slab<T, A> {
             Some(entry) => entry,
             None => {
                 assert_eq!(self.first_free_entry, self.elems.len() + 1);
-                let extend_len = self.elems.len();
-                self.elems.reserve_exact(extend_len);
+                let extend_len = self.elems.len().max(16);
+                self.elems.reserve(extend_len);
                 for i in 0..extend_len {
                     self.elems.push(Entry::Free { next_free: i + 1 });
                 }

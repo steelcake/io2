@@ -16,7 +16,7 @@ use crate::{local_alloc::LocalAlloc, slab, vecmap::VecMap};
 
 thread_local! {
     pub(crate) static CURRENT_TASK_CONTEXT: RefCell<Option<CurrentTaskContext>> = const { RefCell::new(None) };
-    pub(crate) static FILES_TO_CLOSE: RefCell<Vec<RawFd>> = RefCell::new(Vec::with_capacity(128));
+    pub(crate) static FILES_TO_CLOSE: RefCell<Vec<RawFd, LocalAlloc>> = RefCell::new(Vec::with_capacity_in(128, LocalAlloc::new()));
 }
 
 type IoResults = VecMap<slab::Key, i32, LocalAlloc>;
@@ -310,7 +310,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 
         // close files
         FILES_TO_CLOSE.with_borrow_mut(|files| {
-            while let Some(fd) = files.pop() {
+            for &fd in files.iter() {
                 files_closing = files_closing.checked_add(1).unwrap();
                 io_queue.push_back(
                     opcode::Close::new(Fd(fd))
@@ -318,6 +318,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                         .user_data(close_file_io_id.try_into().unwrap()),
                 );
             }
+            files.clear();
         });
     }
 

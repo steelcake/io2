@@ -344,6 +344,8 @@ mod tests {
                 *p.as_mut().as_mut_ptr().add(1024 * 1024 * 12 - 1) = 31;
             };
         }
-        loop {}
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
     }
 }
