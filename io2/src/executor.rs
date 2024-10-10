@@ -219,40 +219,43 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 
     while out.is_none() || files_closing > 0 || FILES_TO_CLOSE.with_borrow(|x| !x.is_empty()) {
         // run notified tasks
-        notifying.clear();
-        notifying.extend(to_notify.iter().map(|kv| kv.0));
-        for &task_id in notifying.iter() {
-            CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
-                *ctx = Some(CurrentTaskContext {
-                    start: Instant::now(),
-                    task_id,
-                    // This is safe because slab contains only pointers to actual tasks,
-                    // we take a pointer and execute our task through it.
-                    // Even if the running tasks spawn another task and the pointer of the running task moves in the slab,
-                    // the actual task doesn't move.
-                    tasks: &mut tasks,
-                    io_results: &mut io_results,
-                    io_queue: &mut io_queue,
-                    preempt_duration,
-                    block_device_infos: &mut block_device_infos,
-                    io: &mut io,
-                    to_notify: &mut to_notify,
+        while !to_notify.is_empty() {
+            notifying.clear();
+            notifying.extend(to_notify.iter().map(|kv| kv.0));
+            to_notify.clear();
+            for &task_id in notifying.iter() {
+                CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+                    *ctx = Some(CurrentTaskContext {
+                        start: Instant::now(),
+                        task_id,
+                        // This is safe because slab contains only pointers to actual tasks,
+                        // we take a pointer and execute our task through it.
+                        // Even if the running tasks spawn another task and the pointer of the running task moves in the slab,
+                        // the actual task doesn't move.
+                        tasks: &mut tasks,
+                        io_results: &mut io_results,
+                        io_queue: &mut io_queue,
+                        preempt_duration,
+                        block_device_infos: &mut block_device_infos,
+                        io: &mut io,
+                        to_notify: &mut to_notify,
+                    });
                 });
-            });
-            let poll_result = tasks
-                .get_mut(task_id)
-                .map(|task| task.as_mut().poll(&mut poll_ctx));
-            CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
-                let _ = ctx.take().unwrap();
-            });
-            let poll_result = match poll_result {
-                Some(p) => p,
-                None => continue,
-            };
-            match poll_result {
-                Poll::Pending => {}
-                Poll::Ready(_) => {
-                    std::mem::drop(tasks.remove(task_id));
+                let poll_result = tasks
+                    .get_mut(task_id)
+                    .map(|task| task.as_mut().poll(&mut poll_ctx));
+                CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+                    let _ = ctx.take().unwrap();
+                });
+                let poll_result = match poll_result {
+                    Some(p) => p,
+                    None => continue,
+                };
+                match poll_result {
+                    Poll::Pending => {}
+                    Poll::Ready(_) => {
+                        std::mem::drop(tasks.remove(task_id));
+                    }
                 }
             }
         }

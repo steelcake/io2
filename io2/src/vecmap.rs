@@ -13,6 +13,16 @@ impl<K: PartialEq, V, A: Allocator + Copy> VecMap<K, V, A> {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.keys.clear();
+        self.values.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        assert_eq!(self.keys.len(), self.values.len());
+        self.keys.is_empty()
+    }
+
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         for (i, k) in self.keys.iter().enumerate() {
             if k == &key {

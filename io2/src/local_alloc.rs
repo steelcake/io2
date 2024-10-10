@@ -266,15 +266,15 @@ unsafe fn alloc_2mb(size: usize) -> io::Result<NonNull<[u8]>> {
 
 unsafe fn alloc_2mb_explicit(size: usize) -> io::Result<NonNull<[u8]>> {
     let size = size.next_multiple_of(TWO_MB);
-    malloc_wrapper(size, libc::MAP_HUGE_2MB | libc::MAP_HUGETLB)
+    mmap_wrapper(size, libc::MAP_HUGE_2MB | libc::MAP_HUGETLB)
 }
 
 unsafe fn alloc_1gb_explicit(size: usize) -> io::Result<NonNull<[u8]>> {
     let size = size.next_multiple_of(ONE_GB);
-    malloc_wrapper(size, libc::MAP_HUGE_1GB | libc::MAP_HUGETLB)
+    mmap_wrapper(size, libc::MAP_HUGE_1GB | libc::MAP_HUGETLB)
 }
 
-unsafe fn malloc_wrapper(len: usize, huge_page_flag: libc::c_int) -> io::Result<NonNull<[u8]>> {
+unsafe fn mmap_wrapper(len: usize, huge_page_flag: libc::c_int) -> io::Result<NonNull<[u8]>> {
     match libc::mmap(
         std::ptr::null_mut(),
         len,
