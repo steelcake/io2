@@ -147,7 +147,7 @@ impl ExecutorConfig {
     pub fn new() -> Self {
         Self {
             ring_depth: 64,
-            preempt_duration: Duration::from_millis(100),
+            preempt_duration: Duration::from_millis(10),
         }
     }
 
