@@ -113,16 +113,15 @@ impl CurrentTaskContext {
     /// Task will be pinned until the entry is completely processed by io_uring.
     /// So it is safe to include pinned pointers to self when building the squeue entry.
     ///
-    /// Safety: caller must make sure the squeue entry is valid.
-    /// Caller future that queued this IO should not return Poll::Ready until it receives
-    /// io completion via take_io_result
+    /// Safety: Caller must make sure the squeue entry is valid as long as the caller future is pinned.
+    /// Caller future should be careful about returning Poll::Ready before all io is complete because the executor will
+    /// drop the future if it returns Poll::Ready and this might invalidate some io operation it queued
+    /// while it is running in the kernel.
     pub(crate) unsafe fn queue_io(&mut self, entry: squeue::Entry) -> slab::Key {
-        unsafe {
-            let io_id = (*self.io).insert(self.task_id);
-            let entry = entry.user_data(io_id.try_into().unwrap());
-            (*self.io_queue).push_back(entry);
-            io_id
-        }
+        let io_id = (*self.io).insert(self.task_id);
+        let entry = entry.user_data(io_id.try_into().unwrap());
+        (*self.io_queue).push_back(entry);
+        io_id
     }
 }
 
@@ -287,6 +286,8 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
             }
 
             match io_queue.pop_front() {
+                // The unsafety is moved to CurrentTaskContext::queue_io function
+                // We require the caller of that function to give a valid squeue entry so the push call here should be safe.
                 Some(entry) => unsafe {
                     if let Err(e) = sq.push(&entry) {
                         panic!("io_uring tried to push to sq while it was full: {:?}", e);
