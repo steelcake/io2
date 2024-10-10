@@ -217,6 +217,31 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     to_notify.insert(task_id, ());
 
     while out.is_none() || files_closing > 0 || FILES_TO_CLOSE.with_borrow(|x| !x.is_empty()) {
+        {
+            let (_, sq, mut cq) = ring.split();
+
+            // nothing to submit, nothing completed yet and there are no tasks to run
+            while sq.is_empty() && cq.is_empty() && to_notify.is_empty() && io_queue.is_empty() {
+                for _ in 0..6 {
+                    if !(sq.is_empty()
+                        && cq.is_empty()
+                        && to_notify.is_empty()
+                        && io_queue.is_empty())
+                    {
+                        break;
+                    } else {
+                        cq.sync();
+                        std::hint::spin_loop();
+                    }
+                }
+                cq.sync();
+                // Not sure if this is the best way to do it. It gives more latency than std::thread::yield_now()
+                // but it makes cpu usage negligible if all we are doing is waiting for some io.
+                // Anyway it is better than using 100% cpu when we are only waiting for io.
+                std::thread::sleep(Duration::from_nanos(1));
+            }
+        }
+
         let last_io_poll = Instant::now();
 
         // run notified tasks

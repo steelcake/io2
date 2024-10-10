@@ -419,6 +419,7 @@ mod tests {
     fn smoke_test() {
         let x = ExecutorConfig::new()
             .run(Box::pin(async {
+                let start = std::time::Instant::now();
                 let file = File::open(Path::new("Cargo.toml"), libc::O_RDONLY, 0)
                     .unwrap()
                     .await
@@ -431,6 +432,7 @@ mod tests {
                 dbg!(num_read);
                 //file.close().await.unwrap();
                 println!("{}", String::from_utf8(out).unwrap());
+                println!("delay {}ns", start.elapsed().as_nanos());
 
                 5
             }))
