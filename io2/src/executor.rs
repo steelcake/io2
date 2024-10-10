@@ -223,11 +223,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
             // nothing to submit, nothing completed yet and there are no tasks to run
             while sq.is_empty() && cq.is_empty() && to_notify.is_empty() && io_queue.is_empty() {
                 for _ in 0..6 {
-                    if !(sq.is_empty()
-                        && cq.is_empty()
-                        && to_notify.is_empty()
-                        && io_queue.is_empty())
-                    {
+                    if cq.is_empty() {
                         break;
                     } else {
                         cq.sync();
