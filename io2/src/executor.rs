@@ -48,7 +48,7 @@ impl Drop for CurrentTaskContextGuard {
 }
 
 impl CurrentTaskContext {
-    pub(crate) fn notify(&mut self, task_id: slab::Key) {
+    fn notify(&mut self, task_id: slab::Key) {
         unsafe {
             (*self.to_notify).insert(task_id, ());
         }
@@ -78,7 +78,7 @@ impl CurrentTaskContext {
         }
     }
 
-    pub fn yield_if_needed(&self) -> bool {
+    fn yield_if_needed(&self) -> bool {
         if self.start.elapsed() < self.preempt_duration {
             false
         } else {
@@ -87,7 +87,7 @@ impl CurrentTaskContext {
         }
     }
 
-    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(
+    pub(crate) fn spawn<T: 'static, F: Future<Output = T> + 'static>(
         &mut self,
         future: F,
     ) -> JoinHandle<T> {
@@ -218,6 +218,8 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     to_notify.insert(task_id, ());
 
     while out.is_none() || files_closing > 0 || FILES_TO_CLOSE.with_borrow(|x| !x.is_empty()) {
+        let last_io_poll = Instant::now();
+
         // run notified tasks
         while !to_notify.is_empty() {
             notifying.clear();
@@ -257,6 +259,10 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                         std::mem::drop(tasks.remove(task_id));
                     }
                 }
+            }
+
+            if last_io_poll.elapsed() > preempt_duration {
+                break;
             }
         }
 
