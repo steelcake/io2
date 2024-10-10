@@ -1,3 +1,4 @@
+use std::alloc::Allocator;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
@@ -358,6 +359,32 @@ impl File {
         }
     }
 
+    pub async fn read_exact<'file, 'buf>(
+        &'file self,
+        buf: &'buf mut [u8],
+        offset: u64,
+    ) -> io::Result<()> {
+        let mut offset = offset;
+        let mut buf = buf;
+
+        while !buf.is_empty() {
+            match self.read(buf, offset).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf = &mut buf[n..];
+                    offset += u64::try_from(n).unwrap();
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !buf.is_empty() {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, ""))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn write<'file, 'buf>(&'file self, buf: &'buf [u8], offset: u64) -> Write<'file, 'buf> {
         Write {
             offset,
@@ -407,6 +434,14 @@ impl Drop for File {
             files.push(self.fd);
         });
     }
+}
+
+pub async fn read<A: Allocator>(path: &Path, alloc: A) -> io::Result<Vec<u8, A>> {
+    let file = File::open(path, libc::O_RDONLY, 0)?.await?;
+    let file_size = file.file_size().await?;
+    let mut buf = Vec::with_capacity_in(usize::try_from(file_size).unwrap(), alloc);
+    file.read_exact(&mut buf, 0).await?;
+    Ok(buf)
 }
 
 #[cfg(test)]

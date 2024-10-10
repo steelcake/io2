@@ -236,7 +236,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                             std::hint::spin_loop();
                         }
                     }
-                    // Not sure if this is the best way to do it. It gives more latency than std::thread::yield_now()
+                    // Not sure if this is the best way to do it. It gives more latency than std::thread::yield_now() (apparently should never use yield_now in linux)
                     // but it makes cpu usage negligible if all we are doing is waiting for some io.
                     // Anyway it is better than using 100% cpu when we are only waiting for io.
                     std::thread::sleep(Duration::from_nanos(1));
@@ -372,8 +372,6 @@ fn try_submit_io(io_queue: &mut VecDeque<squeue::Entry, LocalAlloc>, ring: &mut 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BlockDeviceInfo {
     pub logical_block_size: usize,
-    pub max_sectors_size: usize,
-    pub max_segment_size: usize,
 }
 
 unsafe fn noop_clone(_data: *const ()) -> RawWaker {
