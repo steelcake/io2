@@ -2,7 +2,7 @@ use std::alloc::Allocator;
 
 pub struct Slab<T, A: Allocator> {
     elems: Vec<Entry<T>, A>,
-    first_free_entry: usize,
+    first_free_entry: u32,
     current_generation: u32,
 }
 
@@ -16,7 +16,7 @@ impl<T, A: Allocator> Slab<T, A> {
 
         let mut elems = Vec::with_capacity_in(capacity, alloc);
 
-        for i in 0..capacity {
+        for i in 0..u32::try_from(capacity).unwrap() {
             elems.push(Entry::Free { next_free: i + 1 });
         }
 
@@ -28,18 +28,18 @@ impl<T, A: Allocator> Slab<T, A> {
     }
 
     pub fn insert(&mut self, val: T) -> Key {
-        let key_idx = self.first_free_entry;
-        let entry = match self.elems.get_mut(self.first_free_entry) {
+        let key_idx = usize::try_from(self.first_free_entry).unwrap();
+        let entry = match self.elems.get_mut(key_idx) {
             Some(entry) => entry,
             None => {
-                assert_eq!(self.first_free_entry, self.elems.len());
-                let initial_len = self.elems.len();
-                let extend_len = self.elems.len().max(16);
-                self.elems.reserve(extend_len);
+                assert_eq!(key_idx, self.elems.len());
+                let initial_len = u32::try_from(self.elems.len()).unwrap();
+                let extend_len = initial_len.max(16);
+                self.elems.reserve(usize::try_from(extend_len).unwrap());
                 for i in initial_len..initial_len + extend_len {
                     self.elems.push(Entry::Free { next_free: i + 1 });
                 }
-                self.elems.get_mut(self.first_free_entry).unwrap()
+                self.elems.get_mut(key_idx).unwrap()
             }
         };
 
@@ -56,12 +56,12 @@ impl<T, A: Allocator> Slab<T, A> {
 
         Key {
             generation: self.current_generation,
-            index: key_idx,
+            index: u32::try_from(key_idx).unwrap(),
         }
     }
 
     pub fn get(&self, key: Key) -> Option<&T> {
-        match self.elems.get(key.index) {
+        match self.elems.get(usize::try_from(key.index).unwrap()) {
             Some(entry) => match entry {
                 Entry::Occupied { generation, val } => {
                     if *generation > key.generation {
@@ -77,7 +77,7 @@ impl<T, A: Allocator> Slab<T, A> {
     }
 
     pub fn get_mut(&mut self, key: Key) -> Option<&mut T> {
-        match self.elems.get_mut(key.index) {
+        match self.elems.get_mut(usize::try_from(key.index).unwrap()) {
             Some(entry) => match entry {
                 Entry::Occupied { generation, val } => {
                     if *generation > key.generation {
@@ -93,7 +93,7 @@ impl<T, A: Allocator> Slab<T, A> {
     }
 
     pub fn remove(&mut self, key: Key) -> Option<T> {
-        match self.elems.get_mut(key.index) {
+        match self.elems.get_mut(usize::try_from(key.index).unwrap()) {
             Some(entry) => match entry {
                 Entry::Occupied { generation, .. } => {
                     if *generation > key.generation {
@@ -122,32 +122,26 @@ impl<T, A: Allocator> Slab<T, A> {
 
 enum Entry<T> {
     Occupied { generation: u32, val: T },
-    Free { next_free: usize },
+    Free { next_free: u32 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Key {
-    index: usize,
+    index: u32,
     generation: u32,
 }
 
-impl TryFrom<Key> for u64 {
-    type Error = std::num::TryFromIntError;
+impl From<u64> for Key {
+    fn from(val: u64) -> Self {
+        let index = val as u32;
+        let generation = (val >> 32) as u32;
 
-    fn try_from(key: Key) -> Result<Self, Self::Error> {
-        let index = u32::try_from(key.index)?;
-
-        Ok(index as u64 | (key.generation as u64) << 32)
+        Self { index, generation }
     }
 }
 
-impl TryFrom<u64> for Key {
-    type Error = std::num::TryFromIntError;
-
-    fn try_from(val: u64) -> Result<Self, Self::Error> {
-        let index = usize::try_from(val as u32)?;
-        let generation = (val >> 32) as u32;
-
-        Ok(Key { index, generation })
+impl From<Key> for u64 {
+    fn from(key: Key) -> Self {
+        key.index as u64 | (key.generation as u64) << 32
     }
 }

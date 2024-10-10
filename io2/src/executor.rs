@@ -119,7 +119,7 @@ impl CurrentTaskContext {
     /// while it is running in the kernel.
     pub(crate) unsafe fn queue_io(&mut self, entry: squeue::Entry) -> slab::Key {
         let io_id = (*self.io).insert(self.task_id);
-        let entry = entry.user_data(io_id.try_into().unwrap());
+        let entry = entry.user_data(io_id.into());
         (*self.io_queue).push_back(entry);
         io_id
     }
@@ -299,7 +299,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 
         cq.sync();
         for cqe in &mut cq {
-            let io_id = slab::Key::try_from(cqe.user_data()).unwrap();
+            let io_id = slab::Key::from(cqe.user_data());
             if io_id == close_file_io_id {
                 files_closing = files_closing.checked_sub(1).unwrap();
                 continue;
@@ -316,7 +316,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                 io_queue.push_back(
                     opcode::Close::new(Fd(fd))
                         .build()
-                        .user_data(close_file_io_id.try_into().unwrap()),
+                        .user_data(close_file_io_id.into()),
                 );
             }
             files.clear();
