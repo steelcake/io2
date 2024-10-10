@@ -248,7 +248,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
         let start = Instant::now();
 
         // run notified tasks
-        while !to_notify.is_empty() {
+        'notify: while !to_notify.is_empty() {
             notifying.clear();
             notifying.extend(to_notify.iter().map(|kv| kv.0));
             to_notify.clear();
@@ -288,7 +288,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                 }
 
                 if start.elapsed() > preempt_duration {
-                    break;
+                    break 'notify;
                 }
             }
 
