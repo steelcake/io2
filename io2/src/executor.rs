@@ -221,7 +221,12 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
             let (_, sq, mut cq) = ring.split();
 
             // nothing to submit, nothing completed yet and there are no tasks to run
-            while sq.is_empty() && cq.is_empty() && to_notify.is_empty() && io_queue.is_empty() {
+            while sq.is_empty()
+                && cq.is_empty()
+                && to_notify.is_empty()
+                && io_queue.is_empty()
+                && FILES_TO_CLOSE.with_borrow(|x| x.is_empty())
+            {
                 for _ in 0..6 {
                     if cq.is_empty() {
                         break;
