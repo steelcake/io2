@@ -238,7 +238,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
             }
         }
 
-        let last_io_poll = Instant::now();
+        let start = Instant::now();
 
         // run notified tasks
         while !to_notify.is_empty() {
@@ -248,7 +248,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
             for &task_id in notifying.iter() {
                 CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                     *ctx = Some(CurrentTaskContext {
-                        start: last_io_poll,
+                        start,
                         task_id,
                         // This is safe because slab contains only pointers to actual tasks,
                         // we take a pointer and execute our task through it.
@@ -283,7 +283,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 
             try_submit_io(&mut io_queue, &mut ring);
 
-            if last_io_poll.elapsed() > preempt_duration {
+            if start.elapsed() > preempt_duration {
                 break;
             }
         }
