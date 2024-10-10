@@ -290,7 +290,6 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 
         try_submit_io(&mut io_queue, &mut ring);
 
-        // submit queued IO into uring
         let mut cq = ring.completion();
         cq.sync();
         for cqe in &mut cq {
