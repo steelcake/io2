@@ -303,7 +303,6 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 fn try_submit_io(io_queue: &mut VecDeque<squeue::Entry, LocalAlloc>, ring: &mut IoUring) {
     let (submitter, mut sq, _) = ring.split();
 
-    sq.sync();
     while !io_queue.is_empty() {
         if sq.is_full() {
             match submitter.submit() {
