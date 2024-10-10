@@ -228,7 +228,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
             for &task_id in notifying.iter() {
                 CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                     *ctx = Some(CurrentTaskContext {
-                        start: Instant::now(),
+                        start: last_io_poll,
                         task_id,
                         // This is safe because slab contains only pointers to actual tasks,
                         // we take a pointer and execute our task through it.
