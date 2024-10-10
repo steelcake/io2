@@ -32,10 +32,11 @@ impl<T, A: Allocator> Slab<T, A> {
         let entry = match self.elems.get_mut(self.first_free_entry) {
             Some(entry) => entry,
             None => {
-                assert_eq!(self.first_free_entry, self.elems.len() + 1);
+                assert_eq!(self.first_free_entry, self.elems.len());
+                let initial_len = self.elems.len();
                 let extend_len = self.elems.len().max(16);
                 self.elems.reserve(extend_len);
-                for i in 0..extend_len {
+                for i in initial_len..initial_len + extend_len {
                     self.elems.push(Entry::Free { next_free: i + 1 });
                 }
                 self.elems.get_mut(self.first_free_entry).unwrap()
