@@ -12,6 +12,7 @@ thread_local! {
 
 struct State {
     alloc: unsafe fn(size: usize) -> io::Result<NonNull<[u8]>>,
+    free: unsafe fn(ptr: *mut u8, length: usize) -> io::Result<()>,
     // TODO: do allocation of these vectors with a good strategy instead of using global allocator
     pages: Vec<Page>,
     free_list: Vec<Vec<FreeRange>>,
@@ -19,19 +20,21 @@ struct State {
 
 impl State {
     fn new() -> Self {
-        let alloc = match std::env::var(HUGE_PAGE_SIZE_ENV_VAR_NAME) {
+        let (alloc, free): (unsafe fn(_) -> _, unsafe fn(_, _) -> _) = match std::env::var(
+            HUGE_PAGE_SIZE_ENV_VAR_NAME,
+        ) {
             Err(e) => {
                 log::trace!("failed to read {} from environment: {}\nDefaulting using regular 2MB aligned allocations", HUGE_PAGE_SIZE_ENV_VAR_NAME, e);
-                alloc_2mb
+                (alloc_2mb, free_wrapper)
             }
             Ok(huge_page_size) => match huge_page_size.as_str() {
                 "2MB" => {
                     log::trace!("using explicit 2MB huge pages");
-                    alloc_2mb_explicit
+                    (alloc_2mb_explicit, munmap_wrapper)
                 }
                 "1GB" => {
                     log::trace!("using explicit 1GB huge pages");
-                    alloc_1gb_explicit
+                    (alloc_1gb_explicit, munmap_wrapper)
                 }
                 _ => {
                     log::trace!(
@@ -39,13 +42,14 @@ impl State {
                         HUGE_PAGE_SIZE_ENV_VAR_NAME,
                         huge_page_size
                     );
-                    alloc_2mb
+                    (alloc_2mb, free_wrapper)
                 }
             },
         };
 
         Self {
             alloc,
+            free,
             pages: Vec::with_capacity(128),
             free_list: Vec::with_capacity(128),
         }
@@ -216,7 +220,7 @@ unsafe impl Allocator for LocalAlloc {
                 if range.start == page.ptr && range.len == page.size {
                     state.pages.swap_remove(page_idx);
                     state.free_list.swap_remove(page_idx);
-                    unsafe { free(page.ptr, page.size).expect("free a page") };
+                    unsafe { (state.free)(page.ptr, page.size).expect("free a page") };
                 }
             }
         })
@@ -297,7 +301,7 @@ unsafe fn malloc_wrapper(len: usize, huge_page_flag: libc::c_int) -> io::Result<
     }
 }
 
-unsafe fn free(ptr: *mut u8, length: usize) -> io::Result<()> {
+unsafe fn munmap_wrapper(ptr: *mut u8, length: usize) -> io::Result<()> {
     match libc::munmap(ptr as *mut libc::c_void, length) {
         0 => Ok(()),
         -1 => {
@@ -316,6 +320,11 @@ unsafe fn free(ptr: *mut u8, length: usize) -> io::Result<()> {
             ),
         )),
     }
+}
+
+unsafe fn free_wrapper(ptr: *mut u8, _length: usize) -> io::Result<()> {
+    libc::free(ptr as *mut libc::c_void);
+    Ok(())
 }
 
 const ONE_GB: usize = 1024 * 1024 * 1024;
