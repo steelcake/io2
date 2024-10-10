@@ -198,7 +198,6 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
         .setup_submit_all()
         .setup_coop_taskrun()
         .build(ring_depth)?;
-    let (submitter, mut sq, mut cq) = ring.split();
 
     let mut tasks = slab::Slab::<Task, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
     let mut io = slab::Slab::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
@@ -261,51 +260,17 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                 }
             }
 
+            try_submit_io(&mut io_queue, &mut ring);
+
             if last_io_poll.elapsed() > preempt_duration {
                 break;
             }
         }
 
-        sq.sync();
-        if !sq.is_empty() {
-            match submitter.submit() {
-                Ok(_) => (),
-                Err(err) => {
-                    if err.raw_os_error() != Some(libc::EBUSY) {
-                        panic!("failed to io_uring.submit_and_wait: {:?}", err);
-                    }
-                }
-            };
-            sq.sync();
-        }
+        try_submit_io(&mut io_queue, &mut ring);
 
         // submit queued IO into uring
-        loop {
-            if sq.is_full() {
-                match submitter.submit() {
-                    Ok(_) => (),
-                    Err(err) => {
-                        if err.raw_os_error() != Some(libc::EBUSY) {
-                            panic!("failed to io_uring.submit_and_wait: {:?}", err);
-                        }
-                        break;
-                    }
-                };
-                sq.sync();
-            }
-
-            match io_queue.pop_front() {
-                // The unsafety is moved to CurrentTaskContext::queue_io function
-                // We require the caller of that function to give a valid squeue entry so the push call here should be safe.
-                Some(entry) => unsafe {
-                    if let Err(e) = sq.push(&entry) {
-                        panic!("io_uring tried to push to sq while it was full: {:?}", e);
-                    }
-                },
-                None => break,
-            }
-        }
-
+        let mut cq = ring.completion();
         cq.sync();
         for cqe in &mut cq {
             let io_id = slab::Key::from(cqe.user_data());
@@ -333,6 +298,49 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     }
 
     Ok(out.unwrap())
+}
+
+fn try_submit_io(io_queue: &mut VecDeque<squeue::Entry, LocalAlloc>, ring: &mut IoUring) {
+    let (submitter, mut sq, _) = ring.split();
+
+    sq.sync();
+    while !io_queue.is_empty() {
+        if sq.is_full() {
+            match submitter.submit() {
+                Ok(_) => (),
+                Err(err) => {
+                    if err.raw_os_error() != Some(libc::EBUSY) {
+                        panic!("failed to io_uring.submit_and_wait: {:?}", err);
+                    }
+                    break;
+                }
+            };
+            sq.sync();
+        }
+
+        match io_queue.pop_front() {
+            // The unsafety is moved to CurrentTaskContext::queue_io function
+            // We require the caller of that function to give a valid squeue entry so the push call here should be safe.
+            Some(entry) => unsafe {
+                if let Err(e) = sq.push(&entry) {
+                    panic!("io_uring tried to push to sq while it was full: {:?}", e);
+                }
+            },
+            None => break,
+        }
+    }
+
+    if !sq.is_empty() {
+        match submitter.submit() {
+            Ok(_) => (),
+            Err(err) => {
+                if err.raw_os_error() != Some(libc::EBUSY) {
+                    panic!("failed to io_uring.submit_and_wait: {:?}", err);
+                }
+            }
+        };
+        sq.sync();
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
