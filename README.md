@@ -2,6 +2,12 @@
 
 io library
 
+## Requirements for Direct-IO usage
+
+- Need to have linux kernel version >= 6.1
+- Need to use ext4 or xfs.
+- Need to enable io polling on your NVMe disk by setting nvme.poll_queues kernel parameter to at least 1
+
 ## License
 
 Licensed under either of

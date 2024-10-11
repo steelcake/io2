@@ -1,2 +1,2 @@
-pub mod dma_file;
+pub mod dio_file;
 pub mod file;
