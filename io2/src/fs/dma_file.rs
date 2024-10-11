@@ -1,6 +1,6 @@
 use std::{io, path::Path};
 
-use super::file::File;
+use super::file::{self, File};
 
 pub struct DmaFile {
     file: File,
@@ -20,11 +20,15 @@ impl DmaFile {
         })
     }
 
-    pub fn as_file(&self) -> &File {
-        &self.file
+    pub fn close(self) -> file::Close {
+        self.file.close()
     }
 
-    pub fn into_file(self) -> File {
-        self.file
+    pub async fn file_size(&self) -> io::Result<u64> {
+        self.file.file_size().await
+    }
+
+    pub fn sync_all(&self) -> file::SyncAll {
+        self.file.sync_all()
     }
 }
