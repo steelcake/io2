@@ -20,7 +20,6 @@ thread_local! {
 }
 
 type IoResults = VecMap<slab::Key, i32, LocalAlloc>;
-type BlockDeviceInfos = VecMap<u32, BlockDeviceInfo, LocalAlloc>;
 type ToNotify = VecMap<slab::Key, (), LocalAlloc>;
 type Task = Pin<Box<dyn Future<Output = ()>, LocalAlloc>>;
 
@@ -31,7 +30,6 @@ pub(crate) struct CurrentTaskContext {
     io_results: *mut IoResults,
     io_queue: *mut VecDeque<squeue::Entry, LocalAlloc>,
     preempt_duration: Duration,
-    block_device_infos: *mut BlockDeviceInfos,
     io: *mut slab::Slab<slab::Key, LocalAlloc>,
     to_notify: *mut ToNotify,
 }
@@ -62,18 +60,6 @@ impl CurrentTaskContext {
                     Some(res)
                 }
                 None => None,
-            }
-        }
-    }
-
-    pub(crate) fn get_block_device_info(&self, major: u32) -> Option<BlockDeviceInfo> {
-        unsafe { (*self.block_device_infos).get(&major).copied() }
-    }
-
-    pub(crate) fn set_block_device_info(&mut self, major: u32, block_device: BlockDeviceInfo) {
-        unsafe {
-            if let Some(existing_device) = (*self.block_device_infos).insert(major, block_device) {
-                assert_eq!(existing_device, block_device);
             }
         }
     }
@@ -203,7 +189,6 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     let mut io = slab::Slab::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
     let mut io_queue =
         VecDeque::<squeue::Entry, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
-    let mut block_device_infos = BlockDeviceInfos::with_capacity_in(16, LocalAlloc::new());
     let mut io_results =
         IoResults::with_capacity_in(usize::try_from(ring_depth).unwrap() * 4, LocalAlloc::new());
     let mut to_notify = ToNotify::with_capacity_in(128, LocalAlloc::new());
@@ -265,7 +250,6 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                         io_results: &mut io_results,
                         io_queue: &mut io_queue,
                         preempt_duration,
-                        block_device_infos: &mut block_device_infos,
                         io: &mut io,
                         to_notify: &mut to_notify,
                     });
@@ -367,11 +351,6 @@ fn try_submit_io(io_queue: &mut VecDeque<squeue::Entry, LocalAlloc>, ring: &mut 
         };
         sq.sync();
     }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct BlockDeviceInfo {
-    pub logical_block_size: usize,
 }
 
 unsafe fn noop_clone(_data: *const ()) -> RawWaker {
