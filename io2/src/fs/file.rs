@@ -36,8 +36,9 @@ impl Future for Close {
             let fut = self.get_mut();
             match fut.io_id {
                 None => {
-                    fut.io_id =
-                        Some(unsafe { ctx.queue_io(opcode::Close::new(Fd(fut.fd)).build()) });
+                    fut.io_id = Some(unsafe {
+                        ctx.queue_io(opcode::Close::new(Fd(fut.fd)).build(), false)
+                    });
                     Poll::Pending
                 }
                 Some(io_id) => {
@@ -85,6 +86,7 @@ impl Future for Open {
                                 &*fut.how as *const libc::open_how as *const _,
                             )
                             .build(),
+                            false,
                         )
                     });
                     Poll::Pending
@@ -139,6 +141,7 @@ impl<'file, 'buf> Future for Read<'file, 'buf> {
                             )
                             .offset(fut.offset)
                             .build(),
+                            false,
                         )
                     });
                     Poll::Pending
@@ -188,6 +191,7 @@ impl<'file, 'buf> Future for Write<'file, 'buf> {
                             )
                             .offset(fut.offset)
                             .build(),
+                            false,
                         )
                     });
                     Poll::Pending
@@ -244,6 +248,7 @@ impl<'file> Future for Statx<'file> {
                             )
                             .flags(libc::AT_EMPTY_PATH)
                             .build(),
+                            false,
                         )
                     });
                     Poll::Pending
@@ -282,8 +287,9 @@ impl<'file> Future for SyncAll<'file> {
             let fut = self.get_mut();
             match fut.io_id {
                 None => {
-                    fut.io_id =
-                        Some(unsafe { ctx.queue_io(opcode::Fsync::new(Fd(fut.file.fd)).build()) });
+                    fut.io_id = Some(unsafe {
+                        ctx.queue_io(opcode::Fsync::new(Fd(fut.file.fd)).build(), false)
+                    });
                     Poll::Pending
                 }
                 Some(io_id) => {

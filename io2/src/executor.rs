@@ -29,6 +29,7 @@ pub(crate) struct CurrentTaskContext {
     tasks: *mut slab::Slab<Task, LocalAlloc>,
     io_results: *mut IoResults,
     io_queue: *mut VecDeque<squeue::Entry, LocalAlloc>,
+    dio_queue: *mut VecDeque<squeue::Entry, LocalAlloc>,
     preempt_duration: Duration,
     io: *mut slab::Slab<slab::Key, LocalAlloc>,
     to_notify: *mut ToNotify,
@@ -100,13 +101,17 @@ impl CurrentTaskContext {
     /// So it is safe to include pinned pointers to self when building the squeue entry.
     ///
     /// Safety: Caller must make sure the squeue entry is valid as long as the caller future is pinned.
-    /// Caller future should be careful about returning Poll::Ready before all io is complete because the executor will
+    /// Caller future should not return Poll::Ready before all io is complete because the executor will
     /// drop the future if it returns Poll::Ready and this might invalidate some io operation it queued
     /// while it is running in the kernel.
-    pub(crate) unsafe fn queue_io(&mut self, entry: squeue::Entry) -> slab::Key {
+    pub(crate) unsafe fn queue_io(&mut self, entry: squeue::Entry, direct_io: bool) -> slab::Key {
         let io_id = (*self.io).insert(self.task_id);
         let entry = entry.user_data(io_id.into());
-        (*self.io_queue).push_back(entry);
+        if direct_io {
+            (*self.dio_queue).push_back(entry);
+        } else {
+            (*self.io_queue).push_back(entry);
+        }
         io_id
     }
 }
@@ -188,10 +193,18 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
         .setup_submit_all()
         .setup_coop_taskrun()
         .build(ring_depth)?;
+    let mut dio_ring: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder()
+        .setup_single_issuer()
+        .setup_submit_all()
+        .setup_coop_taskrun()
+        .setup_iopoll()
+        .build(ring_depth)?;
 
     let mut tasks = slab::Slab::<Task, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
     let mut io = slab::Slab::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
     let mut io_queue =
+        VecDeque::<squeue::Entry, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
+    let mut dio_queue =
         VecDeque::<squeue::Entry, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
     let mut io_results =
         IoResults::with_capacity_in(usize::try_from(ring_depth).unwrap() * 4, LocalAlloc::new());
@@ -208,6 +221,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     while out.is_none() || files_closing > 0 || FILES_TO_CLOSE.with_borrow(|x| !x.is_empty()) {
         {
             let (_, sq, mut cq) = ring.split();
+            let (dio_submitter, dio_sq, mut dio_cq) = dio_ring.split();
 
             // nothing to submit, nothing completed yet and there are no tasks to run
             if sq.is_empty()
@@ -215,12 +229,23 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                 && to_notify.is_empty()
                 && io_queue.is_empty()
                 && FILES_TO_CLOSE.with_borrow(|x| x.is_empty())
+                && dio_sq.is_empty()
+                && dio_cq.is_empty()
+                && dio_queue.is_empty()
             {
-                'wait: while cq.is_empty() {
+                'wait: loop {
                     for _ in 0..16 {
-                        if cq.is_empty() {
+                        if cq.is_empty() && dio_cq.is_empty() {
                             cq.sync();
-                            std::hint::spin_loop();
+                            match dio_submitter.submit_and_wait(0) {
+                                Ok(_) => (),
+                                Err(err) => {
+                                    if err.raw_os_error() != Some(libc::EBUSY) {
+                                        panic!("failed to io_uring.submit_and_wait on direct_io ring: {:?}", err);
+                                    }
+                                }
+                            }
+                            dio_cq.sync();
                         } else {
                             break 'wait;
                         }
@@ -229,7 +254,6 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                     // but it makes cpu usage negligible if all we are doing is waiting for some io.
                     // Anyway it is better than using 100% cpu when we are only waiting for io.
                     std::thread::sleep(Duration::from_nanos(1));
-                    cq.sync();
                 }
             }
         }
@@ -253,6 +277,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                         tasks: &mut tasks,
                         io_results: &mut io_results,
                         io_queue: &mut io_queue,
+                        dio_queue: &mut dio_queue,
                         preempt_duration,
                         io: &mut io,
                         to_notify: &mut to_notify,
@@ -280,14 +305,18 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                 }
             }
 
-            try_submit_io(&mut io_queue, &mut ring);
+            try_submit_io(&mut io_queue, &mut ring, false);
+            try_submit_io(&mut dio_queue, &mut dio_ring, true);
         }
 
-        try_submit_io(&mut io_queue, &mut ring);
+        try_submit_io(&mut io_queue, &mut ring, false);
+        try_submit_io(&mut dio_queue, &mut dio_ring, true);
 
+        let mut dio_cq = dio_ring.completion();
         let mut cq = ring.completion();
         cq.sync();
-        for cqe in &mut cq {
+        dio_cq.sync();
+        for cqe in cq.chain(dio_cq) {
             let io_id = slab::Key::from(cqe.user_data());
             if io_id == close_file_io_id {
                 files_closing = files_closing.checked_sub(1).unwrap();
@@ -315,7 +344,11 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     Ok(out.unwrap())
 }
 
-fn try_submit_io(io_queue: &mut VecDeque<squeue::Entry, LocalAlloc>, ring: &mut IoUring) {
+fn try_submit_io(
+    io_queue: &mut VecDeque<squeue::Entry, LocalAlloc>,
+    ring: &mut IoUring,
+    direct_io: bool,
+) {
     let (submitter, mut sq, _) = ring.split();
 
     while !io_queue.is_empty() {
@@ -345,7 +378,7 @@ fn try_submit_io(io_queue: &mut VecDeque<squeue::Entry, LocalAlloc>, ring: &mut 
         }
     }
 
-    if !sq.is_empty() {
+    if direct_io || !sq.is_empty() {
         sq.sync();
         match submitter.submit() {
             Ok(_) => (),
