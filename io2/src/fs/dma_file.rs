@@ -97,9 +97,10 @@ mod tests {
         let x = ExecutorConfig::new()
             .run(Box::pin(async {
                 let start = std::time::Instant::now();
-                let file = DmaFile::open(Path::new("Cargo.toml"), libc::O_RDONLY, 0)
+                let file = DmaFile::open(Path::new("src/lib.rs"), libc::O_RDONLY, 0)
                     .await
                     .unwrap();
+                dbg!((file.dio_mem_align, file.dio_offset_align));
                 let size = file.file_size().await.unwrap();
                 dbg!(size);
                 5

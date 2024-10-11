@@ -249,6 +249,7 @@ impl<'file> Future for Statx<'file> {
                                 &*fut.statx as *const libc::statx as *mut _,
                             )
                             .flags(libc::AT_EMPTY_PATH)
+                            .mask(libc::STATX_DIOALIGN)
                             .build(),
                             false,
                         )
