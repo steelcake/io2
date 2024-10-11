@@ -1,6 +1,6 @@
-use std::{io, path::Path};
+use std::{io, marker::PhantomData, path::Path};
 
-use super::file::{self, File};
+use super::file::{Close, File, Read, SyncAll, Write};
 
 pub struct DmaFile {
     file: File,
@@ -20,7 +20,7 @@ impl DmaFile {
         })
     }
 
-    pub fn close(self) -> file::Close {
+    pub fn close(self) -> Close {
         self.file.close()
     }
 
@@ -28,7 +28,53 @@ impl DmaFile {
         self.file.file_size().await
     }
 
-    pub fn sync_all(&self) -> file::SyncAll {
+    pub fn sync_all(&self) -> SyncAll {
         self.file.sync_all()
+    }
+
+    pub fn write_aligned<'file, 'buf>(
+        &'file self,
+        buf: &'buf [u8],
+        offset: u64,
+    ) -> Write<'file, 'buf> {
+        assert_eq!(
+            buf.as_ptr()
+                .align_offset(usize::try_from(self.dio_mem_align).unwrap()),
+            0
+        );
+        assert_eq!(offset % u64::from(self.dio_offset_align), 0);
+        assert_eq!(buf.len() % usize::try_from(self.dio_mem_align).unwrap(), 0);
+
+        Write {
+            offset,
+            buf,
+            file: &self.file,
+            io_id: None,
+            direct_io: true,
+            _non_send: PhantomData,
+        }
+    }
+
+    pub fn read_aligned<'file, 'buf>(
+        &'file self,
+        buf: &'buf mut [u8],
+        offset: u64,
+    ) -> Read<'file, 'buf> {
+        assert_eq!(
+            buf.as_ptr()
+                .align_offset(usize::try_from(self.dio_mem_align).unwrap()),
+            0
+        );
+        assert_eq!(offset % u64::from(self.dio_offset_align), 0);
+        assert_eq!(buf.len() % usize::try_from(self.dio_mem_align).unwrap(), 0);
+
+        Read {
+            offset,
+            buf,
+            file: &self.file,
+            io_id: None,
+            direct_io: true,
+            _non_send: PhantomData,
+        }
     }
 }
