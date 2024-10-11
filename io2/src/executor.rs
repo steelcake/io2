@@ -320,6 +320,7 @@ fn try_submit_io(io_queue: &mut VecDeque<squeue::Entry, LocalAlloc>, ring: &mut 
 
     while !io_queue.is_empty() {
         if sq.is_full() {
+            sq.sync();
             match submitter.submit() {
                 Ok(_) => (),
                 Err(err) => {
@@ -345,6 +346,7 @@ fn try_submit_io(io_queue: &mut VecDeque<squeue::Entry, LocalAlloc>, ring: &mut 
     }
 
     if !sq.is_empty() {
+        sq.sync();
         match submitter.submit() {
             Ok(_) => (),
             Err(err) => {
