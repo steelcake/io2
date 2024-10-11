@@ -111,6 +111,10 @@ impl CurrentTaskContext {
     }
 }
 
+/// Spawns a future to run in the background.
+///
+/// This should only be used if the future to be spawned is doing significant CPU work,
+/// otherwise it is recommended to just nest it into the current future using mechanisms like `futures::future::join` and similar.
 pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(future: F) -> JoinHandle<T> {
     CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
         let ctx = ctx.as_mut().unwrap();
