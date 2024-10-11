@@ -16,7 +16,7 @@ impl DmaFile {
         if statx.stx_dio_mem_align == 0 || statx.stx_dio_offset_align == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "direct_io is not supported on this file",
+                "direct_io is not supported on this file, kernel might be old, or the file might be on an unsupported file system",
             ));
         }
 
@@ -83,5 +83,30 @@ impl DmaFile {
             direct_io: true,
             _non_send: PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::executor::ExecutorConfig;
+
+    use super::*;
+
+    #[test]
+    fn smoke_test_dma_file() {
+        let x = ExecutorConfig::new()
+            .run(Box::pin(async {
+                let start = std::time::Instant::now();
+                let file = DmaFile::open(Path::new("Cargo.toml"), libc::O_RDONLY, 0)
+                    .await
+                    .unwrap();
+                let size = file.file_size().await.unwrap();
+                dbg!(size);
+                5
+            }))
+            .unwrap();
+
+        assert_eq!(x, 5);
+        dbg!(x);
     }
 }

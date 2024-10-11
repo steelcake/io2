@@ -461,7 +461,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn smoke_test() {
+    fn smoke_test_file() {
         let x = ExecutorConfig::new()
             .run(Box::pin(async {
                 let start = std::time::Instant::now();
