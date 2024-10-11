@@ -13,6 +13,13 @@ impl DmaFile {
         let file = File::open(path, flags | libc::O_DIRECT, mode)?.await?;
         let statx = file.statx().await?;
 
+        if statx.stx_dio_mem_align == 0 || statx.stx_dio_offset_align == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "direct_io is not supported on this file",
+            ));
+        }
+
         Ok(DmaFile {
             file,
             dio_mem_align: statx.stx_dio_mem_align,
