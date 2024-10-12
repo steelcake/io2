@@ -84,7 +84,7 @@ impl LocalAlloc {
 
 unsafe impl Allocator for LocalAlloc {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        if layout.align() > TWO_MB {
+        if layout.size() == 0 || layout.align() > TWO_MB {
             return Err(AllocError);
         }
 
