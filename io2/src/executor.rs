@@ -219,7 +219,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     let mut io_results =
         IoResults::with_capacity_in(usize::try_from(ring_depth).unwrap() * 4, LocalAlloc::new());
     let mut to_notify = ToNotify::with_capacity_in(128, LocalAlloc::new());
-    let mut notifying = Vec::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
+    let mut notifying = VecDeque::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
 
     let close_file_task_id = tasks.insert(Box::pin_in(async {}, LocalAlloc::new()));
     let close_file_io_id = io.insert(close_file_task_id);
@@ -272,10 +272,9 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 
         // run notified tasks
         'notify: while !to_notify.is_empty() {
-            notifying.clear();
             notifying.extend(to_notify.iter().map(|kv| kv.0));
             to_notify.clear();
-            for &task_id in notifying.iter() {
+            while let Some(task_id) = notifying.pop_front() {
                 CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                     *ctx = Some(CurrentTaskContext {
                         start,
