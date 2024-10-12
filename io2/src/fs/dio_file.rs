@@ -93,10 +93,17 @@ impl<'file, A: Allocator + Unpin + Copy> Future for Read<'file, A> {
             let ctx = ctx.as_mut().unwrap();
             let fut = self.get_mut();
             match std::mem::replace(fut, Read::Empty) {
-                Read::Start { file, offset, size, alloc, ..} => {
+                Read::Start {
+                    file,
+                    offset,
+                    size,
+                    alloc,
+                    ..
+                } => {
                     let read_offset = align_down(offset, u64::from(file.dio_offset_align));
                     let read_size = align_up(u32::try_from(size).unwrap(), file.dio_offset_align);
-                    let view_start = usize::try_from(offset.checked_sub(read_offset).unwrap()).unwrap();
+                    let view_start =
+                        usize::try_from(offset.checked_sub(read_offset).unwrap()).unwrap();
                     let view_len = size;
 
                     let layout = Layout::from_size_align(
@@ -113,14 +120,35 @@ impl<'file, A: Allocator + Unpin + Copy> Future for Read<'file, A> {
                                 .build(),
                         )
                     };
-                    *fut = Read::Wait { file, io_id, buf, view_start, view_len, _non_send: PhantomData };
+                    *fut = Read::Wait {
+                        file,
+                        io_id,
+                        buf,
+                        view_start,
+                        view_len,
+                        _non_send: PhantomData,
+                    };
                     Poll::Pending
                 }
-                Read::Wait { file, io_id, buf, view_start, view_len, .. } => {
+                Read::Wait {
+                    file,
+                    io_id,
+                    buf,
+                    view_start,
+                    view_len,
+                    ..
+                } => {
                     let io_result = match ctx.take_io_result(io_id) {
                         Some(io_result) => io_result,
                         None => {
-                            *fut = Read::Wait { file, io_id, buf, view_start, view_len, _non_send: PhantomData };
+                            *fut = Read::Wait {
+                                file,
+                                io_id,
+                                buf,
+                                view_start,
+                                view_len,
+                                _non_send: PhantomData,
+                            };
                             return Poll::Pending;
                         }
                     };

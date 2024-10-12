@@ -269,12 +269,11 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
         }
 
         let start = Instant::now();
-
-        // run notified tasks
-        'notify: while !to_notify.is_empty() {
+        if !to_notify.is_empty() {
             notifying.extend(to_notify.iter().map(|kv| kv.0));
             to_notify.clear();
             while let Some(task_id) = notifying.pop_front() {
+                let task_start = Instant::now();
                 CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                     *ctx = Some(CurrentTaskContext {
                         start,
@@ -295,6 +294,9 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                 let poll_result = tasks
                     .get_mut(task_id)
                     .map(|task| task.as_mut().poll(&mut poll_ctx));
+                if task_start.elapsed() > preempt_duration {
+                    log::warn!("a task is using too much cpu time, this might cause other tasks to starve. calling yield_if_needed() more frequently should fix this.");
+                }
                 CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                     let _ = ctx.take().unwrap();
                 });
@@ -310,12 +312,12 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                 }
 
                 if start.elapsed() > preempt_duration {
-                    break 'notify;
+                    break;
                 }
-            }
 
-            try_submit_io(&mut io_queue, &mut ring, false);
-            try_submit_io(&mut dio_queue, &mut dio_ring, true);
+                try_submit_io(&mut io_queue, &mut ring, false);
+                try_submit_io(&mut dio_queue, &mut dio_ring, false);
+            }
         }
 
         try_submit_io(&mut io_queue, &mut ring, false);
@@ -356,7 +358,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 fn try_submit_io(
     io_queue: &mut VecDeque<squeue::Entry, LocalAlloc>,
     ring: &mut IoUring,
-    direct_io: bool,
+    force_submit: bool,
 ) {
     let (submitter, mut sq, _) = ring.split();
 
@@ -387,7 +389,7 @@ fn try_submit_io(
         }
     }
 
-    if direct_io || !sq.is_empty() {
+    if force_submit || !sq.is_empty() {
         sq.sync();
         match submitter.submit() {
             Ok(_) => (),
