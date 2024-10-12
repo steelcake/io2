@@ -455,7 +455,6 @@ mod tests {
     fn smoke_test_file() {
         let x = ExecutorConfig::new()
             .run(Box::pin(async {
-                let start = std::time::Instant::now();
                 let file = File::open(Path::new("Cargo.toml"), libc::O_RDONLY, 0)
                     .unwrap()
                     .await
@@ -464,6 +463,7 @@ mod tests {
                 let size = file.file_size().await.unwrap();
                 dbg!(size);
                 let mut out = vec![0; size.try_into().unwrap()];
+                let start = std::time::Instant::now();
                 let num_read = file.read(&mut out, 0).await.unwrap();
                 dbg!(num_read);
                 //file.close().await.unwrap();

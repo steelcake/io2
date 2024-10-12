@@ -116,10 +116,11 @@ impl<'file, A: Allocator + Unpin + Copy> Future for Read<'file, A> {
                     *fut = Read::Wait { file, io_id, buf, view_start, view_len, _non_send: PhantomData };
                     Poll::Pending
                 }
-                Read::Wait { io_id, buf, view_start, view_len, .. } => {
+                Read::Wait { file, io_id, buf, view_start, view_len, .. } => {
                     let io_result = match ctx.take_io_result(io_id) {
                         Some(io_result) => io_result,
                         None => {
+                            *fut = Read::Wait { file, io_id, buf, view_start, view_len, _non_send: PhantomData };
                             return Poll::Pending;
                         }
                     };
@@ -154,7 +155,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn smoke_test_dma_file() {
+    fn smoke_test_dio_file() {
         let x = ExecutorConfig::new()
             .run(Box::pin(async {
                 let file = DioFile::open(Path::new("Cargo.toml"), libc::O_RDONLY, 0)
