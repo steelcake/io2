@@ -76,4 +76,8 @@ impl<K: PartialEq, V, A: Allocator + Copy> VecMap<K, V, A> {
     ) -> std::iter::Zip<std::slice::IterMut<'_, K>, std::slice::IterMut<'_, V>> {
         self.keys.iter_mut().zip(self.values.iter_mut())
     }
+
+    pub fn iter_keys(&self) -> std::slice::Iter<'_, K> {
+        self.keys.iter()
+    }
 }

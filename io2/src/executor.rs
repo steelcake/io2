@@ -270,7 +270,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 
         let start = Instant::now();
         if !to_notify.is_empty() {
-            notifying.extend(to_notify.iter().map(|kv| kv.0));
+            notifying.extend(to_notify.iter_keys());
             to_notify.clear();
             while let Some(task_id) = notifying.pop() {
                 let task_start = Instant::now();
