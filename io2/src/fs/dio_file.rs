@@ -1,6 +1,22 @@
-use std::{io, marker::PhantomData, path::Path};
+use std::{
+    alloc::{Allocator, Layout},
+    future::Future,
+    io,
+    marker::PhantomData,
+    path::Path,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
-use super::file::{Close, File, Read, SyncAll, Write};
+use io_uring::{opcode, types::Fd};
+
+use crate::{
+    executor::CURRENT_TASK_CONTEXT,
+    io_buffer::{IoBuffer, IoBufferView},
+    slab,
+};
+
+use super::file::{Close, File, SyncAll};
 
 pub struct DioFile {
     file: File,
@@ -39,56 +55,98 @@ impl DioFile {
         self.file.sync_all()
     }
 
-    pub fn write_aligned<'file, 'buf>(
-        &'file self,
-        buf: &'buf [u8],
-        offset: u64,
-    ) -> Write<'file, 'buf> {
-        assert_eq!(
-            buf.as_ptr()
-                .align_offset(usize::try_from(self.dio_mem_align).unwrap()),
-            0
-        );
-        assert_eq!(offset % u64::from(self.dio_offset_align), 0);
-        assert_eq!(buf.len() % usize::try_from(self.dio_mem_align).unwrap(), 0);
-
-        Write {
-            offset,
-            buf,
-            file: &self.file,
-            io_id: None,
-            direct_io: true,
-            _non_send: PhantomData,
-        }
-    }
-
-    pub fn read_aligned<'file, 'buf>(
-        &'file self,
-        buf: &'buf mut [u8],
-        offset: u64,
-    ) -> Read<'file, 'buf> {
-        assert_eq!(
-            buf.as_ptr()
-                .align_offset(usize::try_from(self.dio_mem_align).unwrap()),
-            0
-        );
-        assert_eq!(offset % u64::from(self.dio_offset_align), 0);
-        assert_eq!(buf.len() % usize::try_from(self.dio_mem_align).unwrap(), 0);
+    pub fn read<A: Allocator + Unpin + Copy>(&self, offset: u64, size: usize, alloc: A) -> Read<A> {
+        let read_offset = align_down(offset, u64::from(self.dio_offset_align));
+        let read_size = align_up(u32::try_from(size).unwrap(), self.dio_offset_align);
+        let view_start = usize::try_from(offset.checked_sub(read_offset).unwrap()).unwrap();
 
         Read {
-            offset,
-            buf,
-            file: &self.file,
+            file: self,
+            read_offset,
+            read_size,
+            mem_align: usize::try_from(self.dio_mem_align).unwrap(),
+            view_start,
+            view_len: size,
+            alloc,
             io_id: None,
-            direct_io: true,
+            buf: None,
             _non_send: PhantomData,
         }
     }
 }
 
+pub struct Read<'file, A: Allocator + Unpin + Copy> {
+    file: &'file DioFile,
+    read_offset: u64,
+    read_size: u32,
+    mem_align: usize,
+    view_start: usize,
+    view_len: usize,
+    alloc: A,
+    io_id: Option<slab::Key>,
+    buf: Option<IoBuffer<A>>,
+    _non_send: PhantomData<*mut ()>,
+}
+
+impl<'file, A: Allocator + Unpin + Copy> Future for Read<'file, A> {
+    type Output = io::Result<IoBufferView<A>>;
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+            let ctx = ctx.as_mut().unwrap();
+            let fut = self.get_mut();
+            match fut.io_id {
+                None => {
+                    let layout = Layout::from_size_align(
+                        usize::try_from(fut.read_size).unwrap(),
+                        fut.mem_align,
+                    )
+                    .unwrap();
+                    let mut buf = IoBuffer::new(layout, fut.alloc).unwrap();
+                    let buf_ptr = buf.as_mut_ptr();
+                    fut.buf = Some(buf);
+                    fut.io_id = Some(unsafe {
+                        ctx.queue_dio(
+                            opcode::Read::new(Fd(fut.file.file.fd), buf_ptr, fut.read_size)
+                                .offset(fut.read_offset)
+                                .build(),
+                        )
+                    });
+                    Poll::Pending
+                }
+                Some(io_id) => {
+                    let io_result = match ctx.take_io_result(io_id) {
+                        Some(io_result) => io_result,
+                        None => {
+                            return Poll::Pending;
+                        }
+                    };
+
+                    if io_result < 0 {
+                        Poll::Ready(Err(io::Error::from_raw_os_error(-io_result)))
+                    } else {
+                        let n_read = usize::try_from(io_result).unwrap();
+                        let buf = fut.buf.take().unwrap();
+                        let view = IoBufferView::new(buf, fut.view_start, fut.view_len.min(n_read));
+                        Poll::Ready(Ok(view))
+                    }
+                }
+            }
+        })
+    }
+}
+
+pub(crate) fn align_up(v: u32, align: u32) -> u32 {
+    (v + align - 1) & !(align - 1)
+}
+
+pub(crate) fn align_down(v: u64, align: u64) -> u64 {
+    v & !(align - 1)
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::executor::ExecutorConfig;
+    use crate::{executor::ExecutorConfig, local_alloc::LocalAlloc};
 
     use super::*;
 
@@ -101,23 +159,12 @@ mod tests {
                     .unwrap();
                 dbg!((file.dio_mem_align, file.dio_offset_align));
                 let size = file.file_size().await.unwrap();
-                let size = size.next_multiple_of(u64::from(file.dio_offset_align));
-                let mut buf = vec![0u8; usize::try_from(size).unwrap()];
-                let align_offset = buf
-                    .as_ptr()
-                    .align_offset(usize::try_from(file.dio_mem_align).unwrap());
-                dbg!(align_offset);
-                for _ in 0..align_offset {
-                    buf.push(0);
-                }
-                dbg!(buf[align_offset..]
-                    .as_ptr()
-                    .align_offset(usize::try_from(file.dio_offset_align).unwrap()));
                 let start = std::time::Instant::now();
-                file.read_aligned(&mut buf[align_offset..], 0)
+                let buf = file
+                    .read(0, usize::try_from(size).unwrap(), LocalAlloc::new())
                     .await
                     .unwrap();
-                println!("{}", String::from_utf8(buf).unwrap());
+                println!("{}", std::str::from_utf8(buf.as_slice()).unwrap());
                 println!("delay {}ns", start.elapsed().as_nanos());
                 5
             }))

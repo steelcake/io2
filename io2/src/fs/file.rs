@@ -17,7 +17,7 @@ use crate::local_alloc::LocalAlloc;
 use crate::slab;
 
 pub struct File {
-    fd: RawFd,
+    pub(crate) fd: RawFd,
     _non_send: PhantomData<*mut ()>,
 }
 
@@ -36,9 +36,8 @@ impl Future for Close {
             let fut = self.get_mut();
             match fut.io_id {
                 None => {
-                    fut.io_id = Some(unsafe {
-                        ctx.queue_io(opcode::Close::new(Fd(fut.fd)).build(), false)
-                    });
+                    fut.io_id =
+                        Some(unsafe { ctx.queue_io(opcode::Close::new(Fd(fut.fd)).build()) });
                     Poll::Pending
                 }
                 Some(io_id) => {
@@ -86,7 +85,6 @@ impl Future for Open {
                                 &*fut.how as *const libc::open_how as *const _,
                             )
                             .build(),
-                            false,
                         )
                     });
                     Poll::Pending
@@ -116,12 +114,11 @@ impl Future for Open {
 }
 
 pub struct Read<'file, 'buf> {
-    pub(crate) file: &'file File,
-    pub(crate) offset: u64,
-    pub(crate) buf: &'buf mut [u8],
-    pub(crate) io_id: Option<slab::Key>,
-    pub(crate) direct_io: bool,
-    pub(crate) _non_send: PhantomData<*mut ()>,
+    file: &'file File,
+    offset: u64,
+    buf: &'buf mut [u8],
+    io_id: Option<slab::Key>,
+    _non_send: PhantomData<*mut ()>,
 }
 
 impl<'file, 'buf> Future for Read<'file, 'buf> {
@@ -142,7 +139,6 @@ impl<'file, 'buf> Future for Read<'file, 'buf> {
                             )
                             .offset(fut.offset)
                             .build(),
-                            fut.direct_io,
                         )
                     });
                     Poll::Pending
@@ -167,12 +163,11 @@ impl<'file, 'buf> Future for Read<'file, 'buf> {
 }
 
 pub struct Write<'file, 'buf> {
-    pub(crate) file: &'file File,
-    pub(crate) offset: u64,
-    pub(crate) buf: &'buf [u8],
-    pub(crate) io_id: Option<slab::Key>,
-    pub(crate) direct_io: bool,
-    pub(crate) _non_send: PhantomData<*mut ()>,
+    file: &'file File,
+    offset: u64,
+    buf: &'buf [u8],
+    io_id: Option<slab::Key>,
+    _non_send: PhantomData<*mut ()>,
 }
 
 impl<'file, 'buf> Future for Write<'file, 'buf> {
@@ -193,7 +188,6 @@ impl<'file, 'buf> Future for Write<'file, 'buf> {
                             )
                             .offset(fut.offset)
                             .build(),
-                            fut.direct_io,
                         )
                     });
                     Poll::Pending
@@ -251,7 +245,6 @@ impl<'file> Future for Statx<'file> {
                             .flags(libc::AT_EMPTY_PATH)
                             .mask(libc::STATX_DIOALIGN)
                             .build(),
-                            false,
                         )
                     });
                     Poll::Pending
@@ -290,9 +283,8 @@ impl<'file> Future for SyncAll<'file> {
             let fut = self.get_mut();
             match fut.io_id {
                 None => {
-                    fut.io_id = Some(unsafe {
-                        ctx.queue_io(opcode::Fsync::new(Fd(fut.file.fd)).build(), false)
-                    });
+                    fut.io_id =
+                        Some(unsafe { ctx.queue_io(opcode::Fsync::new(Fd(fut.file.fd)).build()) });
                     Poll::Pending
                 }
                 Some(io_id) => {
@@ -364,7 +356,6 @@ impl File {
             buf,
             file: self,
             io_id: None,
-            direct_io: false,
             _non_send: PhantomData,
         }
     }
@@ -401,7 +392,6 @@ impl File {
             buf,
             file: self,
             io_id: None,
-            direct_io: false,
             _non_send: PhantomData,
         }
     }
