@@ -168,11 +168,11 @@ impl<'file, A: Allocator + Unpin + Copy> Future for Read<'file, A> {
     }
 }
 
-pub(crate) fn align_up(v: u32, align: u32) -> u32 {
+fn align_up(v: u32, align: u32) -> u32 {
     (v + align - 1) & !(align - 1)
 }
 
-pub(crate) fn align_down(v: u64, align: u64) -> u64 {
+fn align_down(v: u64, align: u64) -> u64 {
     v & !(align - 1)
 }
 
