@@ -104,24 +104,15 @@ impl CurrentTaskContext {
     /// Caller future should not return Poll::Ready before all io is complete because the executor will
     /// drop the future if it returns Poll::Ready and this might invalidate some io operation it queued
     /// while it is running in the kernel.
-    pub(crate) unsafe fn queue_io(&mut self, entry: squeue::Entry) -> slab::Key {
+    pub(crate) unsafe fn queue_io(&mut self, entry: squeue::Entry, direct_io: bool) -> slab::Key {
         let io_id = (*self.io).insert(self.task_id);
         let entry = entry.user_data(io_id.into());
-        (*self.io_queue).push_back(entry);
-        io_id
-    }
-
-    /// Task will be pinned until the entry is completely processed by io_uring.
-    /// So it is safe to include pinned pointers to self when building the squeue entry.
-    ///
-    /// Safety: Caller must make sure the squeue entry is valid as long as the caller future is pinned.
-    /// Caller future should not return Poll::Ready before all io is complete because the executor will
-    /// drop the future if it returns Poll::Ready and this might invalidate some io operation it queued
-    /// while it is running in the kernel.
-    pub(crate) unsafe fn queue_dio(&mut self, entry: squeue::Entry) -> slab::Key {
-        let io_id = (*self.io).insert(self.task_id);
-        let entry = entry.user_data(io_id.into());
-        (*self.dio_queue).push_back(entry);
+        let queue = if direct_io {
+            self.dio_queue
+        } else {
+            self.io_queue
+        };
+        (*queue).push_back(entry);
         io_id
     }
 }
