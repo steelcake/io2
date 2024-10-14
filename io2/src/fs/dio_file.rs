@@ -64,17 +64,23 @@ impl DioFile {
         self.file.sync_all()
     }
 
-    pub fn read_aligned<'file, 'buf>(
-        &'file self,
-        buf: &'buf mut [u8],
-        offset: u64,
-    ) -> Read<'file, 'buf> {
+    fn assert_alignment(&self, buf: &[u8], offset: u64) {
         assert_eq!(
             buf.as_ptr()
                 .align_offset(usize::try_from(self.dio_mem_align).unwrap()),
             0
         );
+        let len = u32::try_from(buf.len()).unwrap();
+        assert_eq!(align_up(len, self.dio_offset_align), len);
         assert_eq!(align_down(offset, u64::from(self.dio_offset_align)), offset);
+    }
+
+    pub fn read_aligned<'file, 'buf>(
+        &'file self,
+        buf: &'buf mut [u8],
+        offset: u64,
+    ) -> Read<'file, 'buf> {
+        self.assert_alignment(buf, offset);
 
         Read {
             file: &self.file,
@@ -91,12 +97,7 @@ impl DioFile {
         buf: &'buf [u8],
         offset: u64,
     ) -> Write<'file, 'buf> {
-        assert_eq!(
-            buf.as_ptr()
-                .align_offset(usize::try_from(self.dio_mem_align).unwrap()),
-            0
-        );
-        assert_eq!(align_down(offset, u64::from(self.dio_offset_align)), offset);
+        self.assert_alignment(buf, offset);
 
         Write {
             offset,
