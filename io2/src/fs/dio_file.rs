@@ -1,4 +1,11 @@
-use std::{io, marker::PhantomData, path::Path};
+use std::{
+    alloc::{Allocator, Layout},
+    io,
+    marker::PhantomData,
+    path::Path,
+};
+
+use crate::io_buffer::{IoBuffer, IoBufferView};
 
 use super::file::{Close, File, Read, SyncAll, Write};
 
@@ -100,6 +107,34 @@ impl DioFile {
             _non_send: PhantomData,
         }
     }
+
+    pub async fn read<A: Allocator>(
+        &self,
+        offset: u64,
+        size: usize,
+        alloc: A,
+    ) -> io::Result<IoBufferView<A>> {
+        let read_offset = align_down(offset, u64::from(self.dio_offset_align));
+        let read_size = usize::try_from(align_up(
+            u32::try_from(size).unwrap(),
+            self.dio_offset_align,
+        ))
+        .unwrap();
+        let view_start = usize::try_from(offset.checked_sub(read_offset).unwrap()).unwrap();
+        let view_len = size;
+
+        let layout =
+            Layout::from_size_align(read_size, usize::try_from(self.dio_mem_align).unwrap())
+                .unwrap();
+        let mut buf = IoBuffer::new(layout, alloc).unwrap();
+
+        let n_read = self.read_aligned(buf.as_mut_slice(), read_offset).await?;
+        let n_read_in_range = n_read.saturating_sub(view_start);
+
+        let view = buf.view(view_start, view_len.min(n_read_in_range));
+
+        Ok(view)
+    }
 }
 
 fn align_up(v: u32, align: u32) -> u32 {
@@ -125,17 +160,11 @@ mod tests {
                     .await
                     .unwrap();
                 let size = file.file_size().await.unwrap();
+                let size = usize::try_from(size).unwrap();
                 let start = std::time::Instant::now();
-                let read_size = align_up(u32::try_from(size).unwrap(), file.dio_offset_align);
-                let layout = Layout::from_size_align(
-                    usize::try_from(read_size).unwrap(),
-                    usize::try_from(file.dio_mem_align()).unwrap(),
-                )
-                .unwrap();
-                let mut buf = IoBuffer::new(layout, LocalAlloc::new()).unwrap();
-                let n_read = file.read_aligned(buf.as_mut_slice(), 0).await.unwrap();
-                if n_read != usize::try_from(size).unwrap() {
-                    panic!("wrong sized read. Expected {} Got {}", size, n_read);
+                let buf = file.read(0, size, LocalAlloc::new()).await.unwrap();
+                if buf.len() != size {
+                    panic!("wrong sized read. Expected {} Got {}", size, buf.len());
                 }
                 println!("{}", std::str::from_utf8(buf.as_slice()).unwrap());
                 println!("delay {}ns", start.elapsed().as_nanos());
