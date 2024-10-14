@@ -7,18 +7,29 @@ pub struct IoBuffer<A: Allocator> {
     alloc: A,
     ptr: NonNull<u8>,
     layout: Layout,
+    len: usize,
 }
 
 impl<A: Allocator> IoBuffer<A> {
     pub fn new(layout: Layout, alloc: A) -> Result<Self, AllocError> {
         let mut slice = alloc.allocate(layout)?;
         let ptr = unsafe { NonNull::new_unchecked(slice.as_mut().as_mut_ptr()) };
+        let len = layout.size();
         let layout = Layout::from_size_align(slice.len(), layout.align()).unwrap();
-        Ok(Self { alloc, ptr, layout })
+        Ok(Self {
+            alloc,
+            ptr,
+            layout,
+            len,
+        })
     }
 
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr.as_ptr()
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }
 
@@ -27,23 +38,5 @@ impl<A: Allocator> Drop for IoBuffer<A> {
         unsafe {
             self.alloc.deallocate(self.ptr, self.layout);
         }
-    }
-}
-
-pub struct IoBufferView<A: Allocator> {
-    buf: IoBuffer<A>,
-    offset: usize,
-    len: usize,
-}
-
-impl<A: Allocator> IoBufferView<A> {
-    pub fn new(buf: IoBuffer<A>, offset: usize, len: usize) -> Self {
-        assert!(buf.layout.size() >= offset + len);
-        Self { buf, offset, len }
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        assert!(self.buf.layout.size() >= self.offset + self.len);
-        unsafe { std::slice::from_raw_parts(self.buf.ptr.add(self.offset).as_ptr(), self.len) }
     }
 }

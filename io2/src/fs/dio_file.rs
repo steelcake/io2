@@ -1,20 +1,4 @@
-use std::{
-    alloc::{Allocator, Layout},
-    future::Future,
-    io,
-    marker::PhantomData,
-    path::Path,
-    pin::Pin,
-    task::{Context, Poll},
-};
-
-use io_uring::{opcode, types::Fd};
-
-use crate::{
-    executor::CURRENT_TASK_CONTEXT,
-    io_buffer::{IoBuffer, IoBufferView},
-    slab,
-};
+use std::{io, marker::PhantomData, path::Path};
 
 use super::file::{Close, File, Read, SyncAll, Write};
 
@@ -50,6 +34,14 @@ impl DioFile {
             dio_mem_align: statx.stx_dio_mem_align,
             dio_offset_align: statx.stx_dio_offset_align,
         })
+    }
+
+    pub fn dio_mem_align(&self) -> u32 {
+        self.dio_mem_align
+    }
+
+    pub fn dio_offset_align(&self) -> u32 {
+        self.dio_offset_align
     }
 
     pub fn close(self) -> Close {
@@ -120,31 +112,38 @@ fn align_down(v: u64, align: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{executor::ExecutorConfig, local_alloc::LocalAlloc};
+    use crate::{executor::ExecutorConfig, io_buffer::IoBuffer, local_alloc::LocalAlloc};
+    use std::alloc::Layout;
 
     use super::*;
 
-    // #[test]
-    // fn smoke_test_dio_file() {
-    //     let x = ExecutorConfig::new()
-    //         .run(Box::pin(async {
-    //             let file = DioFile::open(Path::new("Cargo.toml"), libc::O_RDONLY, 0)
-    //                 .await
-    //                 .unwrap();
-    //             dbg!((file.dio_mem_align, file.dio_offset_align));
-    //             let size = file.file_size().await.unwrap();
-    //             let start = std::time::Instant::now();
-    //             let buf = file
-    //                 .read(0, usize::try_from(size).unwrap(), LocalAlloc::new())
-    //                 .await
-    //                 .unwrap();
-    //             println!("{}", std::str::from_utf8(buf.as_slice()).unwrap());
-    //             println!("delay {}ns", start.elapsed().as_nanos());
-    //             5
-    //         }))
-    //         .unwrap();
+    #[test]
+    fn smoke_test_dio_file() {
+        let x = ExecutorConfig::new()
+            .run(Box::pin(async {
+                let file = DioFile::open(Path::new("Cargo.toml"), libc::O_RDONLY, 0)
+                    .await
+                    .unwrap();
+                let size = file.file_size().await.unwrap();
+                let start = std::time::Instant::now();
+                let read_size = align_up(u32::try_from(size).unwrap(), file.dio_offset_align);
+                let layout = Layout::from_size_align(
+                    usize::try_from(read_size).unwrap(),
+                    usize::try_from(file.dio_mem_align()).unwrap(),
+                )
+                .unwrap();
+                let mut buf = IoBuffer::new(layout, LocalAlloc::new()).unwrap();
+                let n_read = file.read_aligned(buf.as_mut_slice(), 0).await.unwrap();
+                if n_read != usize::try_from(size).unwrap() {
+                    panic!("wrong sized read. Expected {} Got {}", size, n_read);
+                }
+                println!("{}", std::str::from_utf8(buf.as_slice()).unwrap());
+                println!("delay {}ns", start.elapsed().as_nanos());
+                5
+            }))
+            .unwrap();
 
-    //     assert_eq!(x, 5);
-    //     dbg!(x);
-    // }
+        assert_eq!(x, 5);
+        dbg!(x);
+    }
 }
