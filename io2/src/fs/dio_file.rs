@@ -108,6 +108,75 @@ impl DioFile {
         }
     }
 
+    pub async fn write_exact_aligned(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        let mut retry: Option<usize> = None;
+        loop {
+            match self.write_aligned(buf, offset).await {
+                Ok(n) => {
+                    if n < buf.len() {
+                        if retry == Some(n) {
+                            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                        }
+                        retry = Some(n);
+                    } else {
+                        return Ok(());
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    pub async fn write_exact<A: Allocator>(
+        &self,
+        buf: &[u8],
+        offset: u64,
+        alloc: A,
+    ) -> io::Result<()> {
+        let write_offset = align_down(offset, u64::from(self.dio_offset_align));
+        let write_size = usize::try_from(align_up(
+            u32::try_from(buf.len()).unwrap(),
+            self.dio_offset_align,
+        ))
+        .unwrap();
+
+        if write_offset == offset && write_size == buf.len() {
+            return self.write_exact_aligned(buf, offset).await;
+        }
+
+        let layout =
+            Layout::from_size_align(write_size, usize::try_from(self.dio_mem_align).unwrap())
+                .unwrap();
+        let mut write_buf = IoBuffer::new(layout, alloc).unwrap();
+
+        let start_diff = offset.checked_sub(write_offset).unwrap();
+        if start_diff > 0 {
+            self.read_exact_aligned(
+                &mut write_buf.as_mut_slice()[..usize::try_from(self.dio_offset_align).unwrap()],
+                write_offset,
+            )
+            .await?;
+        }
+
+        let end_diff = (write_offset + u64::try_from(write_size).unwrap())
+            .checked_sub(offset + u64::try_from(buf.len()).unwrap())
+            .unwrap();
+        if end_diff > 0 {
+            self.read_exact_aligned(
+                &mut write_buf.as_mut_slice()[usize::try_from(end_diff).unwrap()..],
+                write_offset + end_diff,
+            )
+            .await?;
+        }
+
+        let start_diff = usize::try_from(start_diff).unwrap();
+        write_buf.as_mut_slice()[start_diff..start_diff + buf.len()].copy_from_slice(buf);
+
+        self.write_exact_aligned(write_buf.as_slice(), write_offset)
+            .await
+    }
+
     pub async fn read<A: Allocator>(
         &self,
         offset: u64,
@@ -134,6 +203,26 @@ impl DioFile {
         let view = buf.view(view_start, view_len.min(n_read_in_range));
 
         Ok(view)
+    }
+
+    pub async fn read_exact_aligned(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        let mut retry: Option<usize> = None;
+        loop {
+            match self.read_aligned(buf, offset).await {
+                Ok(n) => {
+                    if n < buf.len() {
+                        if retry == Some(n) {
+                            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                        }
+                        retry = Some(n);
+                    } else {
+                        return Ok(());
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     pub async fn read_exact<A: Allocator>(
