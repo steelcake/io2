@@ -135,6 +135,60 @@ impl DioFile {
 
         Ok(view)
     }
+
+    pub async fn read_exact<A: Allocator>(
+        &self,
+        offset: u64,
+        size: usize,
+        alloc: A,
+    ) -> io::Result<IoBufferView<A>> {
+        let read_offset = align_down(offset, u64::from(self.dio_offset_align));
+        let read_size = usize::try_from(align_up(
+            u32::try_from(size).unwrap(),
+            self.dio_offset_align,
+        ))
+        .unwrap();
+        let view_start = usize::try_from(offset.checked_sub(read_offset).unwrap()).unwrap();
+        let view_len = size;
+
+        let layout =
+            Layout::from_size_align(read_size, usize::try_from(self.dio_mem_align).unwrap())
+                .unwrap();
+        let mut buf = IoBuffer::new(layout, alloc).unwrap();
+        let mut buf_slice = buf.as_mut_slice();
+        let mut read_offset = read_offset;
+        let mut total_read = 0;
+        let mut retry: Option<usize> = None;
+
+        let min_offset_increment =
+            usize::try_from(self.dio_offset_align.max(self.dio_mem_align)).unwrap();
+
+        loop {
+            match self.read_aligned(buf_slice, read_offset).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if total_read + n >= view_start + view_len {
+                        break;
+                    }
+                    if n >= min_offset_increment {
+                        total_read += min_offset_increment;
+                        buf_slice = &mut buf_slice[min_offset_increment..];
+                        read_offset += u64::try_from(min_offset_increment).unwrap();
+                        retry = None;
+                    } else {
+                        if retry == Some(n) {
+                            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                        }
+                        retry = Some(n);
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(buf.view(view_start, view_len))
+    }
 }
 
 fn align_up(v: u32, align: u32) -> u32 {
@@ -147,8 +201,7 @@ fn align_down(v: u64, align: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{executor::ExecutorConfig, io_buffer::IoBuffer, local_alloc::LocalAlloc};
-    use std::alloc::Layout;
+    use crate::{executor::ExecutorConfig, local_alloc::LocalAlloc};
 
     use super::*;
 
@@ -162,10 +215,8 @@ mod tests {
                 let size = file.file_size().await.unwrap();
                 let size = usize::try_from(size).unwrap();
                 let start = std::time::Instant::now();
-                let buf = file.read(0, size, LocalAlloc::new()).await.unwrap();
-                if buf.len() != size {
-                    panic!("wrong sized read. Expected {} Got {}", size, buf.len());
-                }
+                let buf = file.read_exact(0, size, LocalAlloc::new()).await.unwrap();
+                assert_eq!(buf.len(), size);
                 println!("{}", std::str::from_utf8(buf.as_slice()).unwrap());
                 println!("delay {}ns", start.elapsed().as_nanos());
                 5
