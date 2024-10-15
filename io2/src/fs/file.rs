@@ -369,6 +369,27 @@ impl File {
         }
     }
 
+    pub async fn write_all(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        let mut offset = offset;
+        let mut buf = buf;
+
+        while !buf.is_empty() {
+            match self.write(buf, offset).await {
+                Ok(0) => {
+                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                }
+                Ok(n) => {
+                    buf = &buf[n..];
+                    offset += u64::try_from(n).unwrap();
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn read_exact<'file, 'buf>(
         &'file self,
         buf: &'buf mut [u8],
@@ -389,7 +410,7 @@ impl File {
             }
         }
         if !buf.is_empty() {
-            Err(io::Error::new(io::ErrorKind::UnexpectedEof, ""))
+            Err(io::Error::from(io::ErrorKind::UnexpectedEof))
         } else {
             Ok(())
         }
