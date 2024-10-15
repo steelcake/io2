@@ -108,7 +108,7 @@ impl DioFile {
         }
     }
 
-    pub async fn write_exact_aligned(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+    pub async fn write_all_aligned(&self, buf: &[u8], offset: u64) -> io::Result<()> {
         let mut retry: Option<usize> = None;
         loop {
             match self.write_aligned(buf, offset).await {
@@ -128,7 +128,7 @@ impl DioFile {
         }
     }
 
-    pub async fn write_exact<A: Allocator>(
+    pub async fn write_all<A: Allocator>(
         &self,
         buf: &[u8],
         offset: u64,
@@ -142,7 +142,7 @@ impl DioFile {
         .unwrap();
 
         if write_offset == offset && write_size == buf.len() {
-            return self.write_exact_aligned(buf, offset).await;
+            return self.write_all_aligned(buf, offset).await;
         }
 
         let layout =
@@ -173,7 +173,7 @@ impl DioFile {
         let start_diff = usize::try_from(start_diff).unwrap();
         write_buf.as_mut_slice()[start_diff..start_diff + buf.len()].copy_from_slice(buf);
 
-        self.write_exact_aligned(write_buf.as_slice(), write_offset)
+        self.write_all_aligned(write_buf.as_slice(), write_offset)
             .await
     }
 
