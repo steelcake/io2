@@ -21,6 +21,7 @@ pub struct File {
     _non_send: PhantomData<*mut ()>,
 }
 
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Close {
     io_id: Option<slab::Key>,
     fd: RawFd,
@@ -61,6 +62,7 @@ impl Future for Close {
 }
 
 pin_project! {
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
     pub struct Open {
         path: LocalCString,
         #[pin] how: libc::open_how,
@@ -115,6 +117,7 @@ impl Future for Open {
     }
 }
 
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Read<'file, 'buf> {
     pub(crate) file: &'file File,
     pub(crate) offset: u64,
@@ -166,6 +169,7 @@ impl<'file, 'buf> Future for Read<'file, 'buf> {
     }
 }
 
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Write<'file, 'buf> {
     pub(crate) file: &'file File,
     pub(crate) offset: u64,
@@ -218,6 +222,7 @@ impl<'file, 'buf> Future for Write<'file, 'buf> {
 }
 
 pin_project! {
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
     pub(crate) struct Statx<'file> {
         file: &'file File,
         io_id: Option<slab::Key>,
@@ -275,6 +280,7 @@ impl<'file> Future for Statx<'file> {
     }
 }
 
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct SyncAll<'file> {
     file: &'file File,
     io_id: Option<slab::Key>,

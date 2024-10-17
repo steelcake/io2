@@ -23,6 +23,11 @@ type IoResults = VecMap<slab::Key, i32, LocalAlloc>;
 type ToNotify = VecMap<slab::Key, (), LocalAlloc>;
 type Task = Pin<Box<dyn Future<Output = ()>, LocalAlloc>>;
 
+struct NotifyWhen {
+    timer: Vec<Instant, LocalAlloc>,
+    task_id: Vec<slab::Key, LocalAlloc>,
+}
+
 pub(crate) struct CurrentTaskContext {
     start: Instant,
     task_id: slab::Key,
@@ -33,6 +38,7 @@ pub(crate) struct CurrentTaskContext {
     preempt_duration: Duration,
     io: *mut slab::Slab<slab::Key, LocalAlloc>,
     to_notify: *mut ToNotify,
+    notify_when: *mut NotifyWhen,
 }
 
 // This is to clear data in CURRENT_TASK_CONTEXT in case one of the tasks panic while getting polled
@@ -114,6 +120,14 @@ impl CurrentTaskContext {
         };
         (*queue).push_back(entry);
         io_id
+    }
+
+    pub(crate) fn notify_when(&mut self, when: Instant) {
+        unsafe {
+            let n = &mut *self.notify_when;
+            n.timer.push(when);
+            n.task_id.push(self.task_id);
+        };
     }
 }
 
@@ -211,6 +225,10 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
         IoResults::with_capacity_in(usize::try_from(ring_depth).unwrap() * 4, LocalAlloc::new());
     let mut to_notify = ToNotify::with_capacity_in(128, LocalAlloc::new());
     let mut notifying = Vec::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
+    let mut notify_when = NotifyWhen {
+        timer: Vec::<Instant, LocalAlloc>::with_capacity_in(128, LocalAlloc::new()),
+        task_id: Vec::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new()),
+    };
 
     let close_file_task_id = tasks.insert(Box::pin_in(async {}, LocalAlloc::new()));
     let close_file_io_id = io.insert(close_file_task_id);
@@ -236,7 +254,8 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
             {
                 'wait: loop {
                     for _ in 0..16 {
-                        if cq.is_empty() && dio_cq.is_empty() {
+                        if cq.is_empty() && dio_cq.is_empty() && to_notify.is_empty() {
+                            notify_timers(&mut notify_when, &mut to_notify);
                             cq.sync();
                             match dio_submitter.submit_and_wait(0) {
                                 Ok(_) => (),
@@ -280,6 +299,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                         preempt_duration,
                         io: &mut io,
                         to_notify: &mut to_notify,
+                        notify_when: &mut notify_when,
                     });
                 });
                 let poll_result = tasks
@@ -329,6 +349,8 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
             to_notify.insert(task_id, ());
         }
 
+        notify_timers(&mut notify_when, &mut to_notify);
+
         // close files
         FILES_TO_CLOSE.with_borrow_mut(|files| {
             for &fd in files.iter() {
@@ -344,6 +366,25 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     }
 
     Ok(out.unwrap())
+}
+
+fn notify_timers(notify_when: &mut NotifyWhen, to_notify: &mut VecMap<slab::Key, (), LocalAlloc>) {
+    let time = Instant::now();
+    let mut i = 0;
+    loop {
+        if i >= notify_when.timer.len() {
+            break;
+        }
+
+        let timer = *notify_when.timer.get(i).unwrap();
+        if timer >= time {
+            i += 1;
+        } else {
+            notify_when.timer.swap_remove(i);
+            let task_id = notify_when.task_id.swap_remove(i);
+            to_notify.insert(task_id, ());
+        }
+    }
 }
 
 fn try_submit_io(
@@ -411,6 +452,7 @@ pub fn noop_waker() -> Waker {
     unsafe { Waker::from_raw(noop_raw_waker()) }
 }
 
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct YieldIfNeeded;
 
 impl Future for YieldIfNeeded {
