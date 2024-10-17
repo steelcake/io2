@@ -39,6 +39,7 @@ pub(crate) struct CurrentTaskContext {
     io: *mut slab::Slab<slab::Key, LocalAlloc>,
     to_notify: *mut ToNotify,
     notify_when: *mut NotifyWhen,
+    num_dio_running: *mut usize,
 }
 
 // This is to clear data in CURRENT_TASK_CONTEXT in case one of the tasks panic while getting polled
@@ -114,6 +115,7 @@ impl CurrentTaskContext {
         let io_id = (*self.io).insert(self.task_id);
         let entry = entry.user_data(io_id.into());
         let queue = if direct_io {
+            *self.num_dio_running = (*self.num_dio_running).checked_add(1).unwrap();
             self.dio_queue
         } else {
             self.io_queue
@@ -229,6 +231,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
         timer: Vec::<Instant, LocalAlloc>::with_capacity_in(128, LocalAlloc::new()),
         task_id: Vec::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new()),
     };
+    let mut num_dio_running = 0usize;
 
     let close_file_task_id = tasks.insert(Box::pin_in(async {}, LocalAlloc::new()));
     let close_file_io_id = io.insert(close_file_task_id);
@@ -257,15 +260,17 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                         if cq.is_empty() && dio_cq.is_empty() && to_notify.is_empty() {
                             notify_timers(&mut notify_when, &mut to_notify);
                             cq.sync();
-                            match dio_submitter.submit_and_wait(0) {
-                                Ok(_) => (),
-                                Err(err) => {
-                                    if err.raw_os_error() != Some(libc::EBUSY) {
-                                        panic!("failed to io_uring.submit_and_wait on direct_io ring: {:?}", err);
+                            if num_dio_running > 0 {
+                                match dio_submitter.submit_and_wait(0) {
+                                    Ok(_) => (),
+                                    Err(err) => {
+                                        if err.raw_os_error() != Some(libc::EBUSY) {
+                                            panic!("failed to io_uring.submit_and_wait on direct_io ring: {:?}", err);
+                                        }
                                     }
                                 }
+                                dio_cq.sync();
                             }
-                            dio_cq.sync();
                         } else {
                             break 'wait;
                         }
@@ -300,6 +305,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                         io: &mut io,
                         to_notify: &mut to_notify,
                         notify_when: &mut notify_when,
+                        num_dio_running: &mut num_dio_running,
                     });
                 });
                 let poll_result = tasks
@@ -338,6 +344,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
         let mut cq = ring.completion();
         cq.sync();
         dio_cq.sync();
+        num_dio_running = num_dio_running.checked_sub(dio_cq.len()).unwrap();
         for cqe in cq.chain(dio_cq) {
             let io_id = slab::Key::from(cqe.user_data());
             if io_id == close_file_io_id {
