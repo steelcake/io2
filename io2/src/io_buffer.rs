@@ -1,6 +1,6 @@
 use std::{
     alloc::{AllocError, Allocator, Layout},
-    ptr::NonNull,
+    ptr::NonNull, rc::Rc,
 };
 
 pub struct IoBuffer<A: Allocator> {
@@ -50,7 +50,7 @@ impl<A: Allocator> Drop for IoBuffer<A> {
 }
 
 pub struct IoBufferView<A: Allocator> {
-    buf: IoBuffer<A>,
+    buf: Rc<IoBuffer<A>>,
     offset: usize,
     len: usize,
 }
@@ -58,8 +58,9 @@ pub struct IoBufferView<A: Allocator> {
 impl<A: Allocator> IoBufferView<A> {
     pub fn new(buf: IoBuffer<A>, offset: usize, len: usize) -> Self {
         assert!(buf.layout.size() >= offset + len);
-        Self { buf, offset, len }
+        Self { buf: Rc::new(buf), offset, len }
     }
+
     pub fn as_slice(&self) -> &[u8] {
         assert!(self.buf.layout.size() >= self.offset + self.len);
         unsafe { std::slice::from_raw_parts(self.buf.ptr.add(self.offset).as_ptr(), self.len) }
@@ -71,5 +72,15 @@ impl<A: Allocator> IoBufferView<A> {
 
     pub fn is_empty(&self) -> bool {
         self.len > 0
+    }
+
+    pub fn view(&self, offset: usize, len: usize) -> IoBufferView<A> {
+        assert!(self.len >= offset + len);
+
+        IoBufferView {
+            buf: self.buf.clone(),
+            offset: self.offset+offset,
+            len: len,
+        }
     }
 }

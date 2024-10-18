@@ -1,11 +1,10 @@
 use std::{
-    alloc::{Allocator, Layout},
-    io,
-    marker::PhantomData,
-    path::Path,
+    alloc::{Allocator, Layout}, collections::VecDeque, future::Future, io, marker::PhantomData, path::Path
 };
 
-use crate::io_buffer::{IoBuffer, IoBufferView};
+use io_uring::squeue;
+
+use crate::{io_buffer::{IoBuffer, IoBufferView}, slab};
 
 use super::file::{Close, File, Read, SyncAll, Write};
 
@@ -278,6 +277,40 @@ impl DioFile {
 
         Ok(buf.view(view_start, view_len))
     }
+
+    pub fn read_stream<'file, 'iovs, A: Allocator, IOVS: Iterator<Item=(u64, usize)>>(&self, iovs: IOVS, concurrency: usize, max_single_read_size: u64, alloc: A) -> ReadStream<'file, 'iovs, A> {
+        let mut io_queue = Vec::<(u64, usize), A>::with_capacity_in(128, alloc);
+        let mut io: Option<(u64, usize)> = None;
+
+        for iov in iovs {
+            assert!(iov.0 >= io.0 + u64::try_from(io.1).unwrap());
+            assert!(iov.1 > 0);
+
+            if io.0.checked_sub(iov.0).unwrap() <= max_single_read_size {
+
+            } else if io != (0, 0) {
+                io_queue.push(io);
+            }
+        }
+
+        todo!()
+    }
+}
+
+// iovs [(x0, x1), (x2, x3), (x4, x5)]
+// actual reads [(z0, z1), (z2, z3)]
+// when read0 finishes return first two iovs
+// 
+
+#[must_use = "streams do nothing unless polled"]
+struct ReadStream<'file, 'iovs, A: Allocator> {
+    file: &'file DioFile,
+    running_iovs: &'iovs [(u64, usize)],
+    buf: IoBuffer<A>,
+    io_queue: Vec<squeue::Entry, A>,
+    running_io: String,
+    return_queue: VecDeque<Option<IoBufferView<A>>, A>,
+    _non_send: PhantomData<*mut ()>,
 }
 
 fn align_up(v: u32, align: u32) -> u32 {
