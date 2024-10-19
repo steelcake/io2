@@ -6,13 +6,16 @@ use std::{
     marker::PhantomData,
     path::Path,
     rc::Weak,
+    task::Poll,
 };
 
+use futures_core::Stream;
 use io_uring::squeue;
 
 use crate::{
     io_buffer::{IoBuffer, IoBufferView},
     slab,
+    vecmap::VecMap,
 };
 
 use super::file::{Close, File, Read, SyncAll, Write};
@@ -137,7 +140,7 @@ impl DioFile {
         offset: u64,
         alloc: A,
     ) -> io::Result<()> {
-        let (write_offset, write_size) = align_iov(self.dio_offset_align, (offset, buf.len())); 
+        let (write_offset, write_size) = align_iov(self.dio_offset_align, (offset, buf.len()));
 
         let layout =
             Layout::from_size_align(write_size, usize::try_from(self.dio_mem_align).unwrap())
@@ -266,47 +269,45 @@ impl DioFile {
         Ok(buf.view(view_start, view_len))
     }
 
-    pub fn read_stream<'file, 'iovs, A: Allocator + Copy>(
-        &self,
+    pub fn read_stream<'file, A: Allocator + Unpin + Copy>(
+        &'file self,
         iovs: Vec<(u64, usize), A>,
         concurrency: usize,
         max_single_read_size: usize,
         max_merge_len: u64,
         alloc: A,
-    ) -> ReadStream<'file, 'iovs, A> {
-        if iovs.is_empty() {
-            todo!();
+    ) -> ReadStream<'file, A> {
+        ReadStream::Prep {
+            iovs,
+            file: self,
+            concurrency,
+            max_single_read_size,
+            max_merge_len,
+            alloc,
+            _non_send: PhantomData,
         }
-
-        let mut iovs = iovs;
-        iovs.sort_unstable_by_key(|v| v.0);
-
-        todo!()
     }
 }
 
-fn align_iov(
-    dio_offset_align: u64,
-    (offset, size): (u64, usize),
-) -> (u64, usize) {
+fn align_iov(dio_offset_align: u64, (offset, size): (u64, usize)) -> (u64, usize) {
     (
         align_down(offset, dio_offset_align),
-        usize::try_from(align_up(
-            u64::try_from(size).unwrap(),
-            dio_offset_align,
-        ))
-        .unwrap(),
+        usize::try_from(align_up(u64::try_from(size).unwrap(), dio_offset_align)).unwrap(),
     )
 }
 
-fn prep_dio_list<A: Allocator, F: Fn((u64, usize)) -> (u64, usize)>(
+fn prep_dio_list<A: Allocator + Copy>(
     iovs: &[(u64, usize)],
     dio_offset_align: u64,
+    dio_mem_align: usize,
     max_merge_len: u64,
     max_single_read_size: usize,
     alloc: A,
-) -> Vec<(u64, usize), A> {
+) -> (Vec<(u64, usize), A>, Vec<IoBuffer<A>, A>) {
+    assert!(!iovs.is_empty());
+
     let mut dio_list = Vec::<(u64, usize), A>::with_capacity_in(iovs.len(), alloc);
+    let mut io_buffers = Vec::<IoBuffer<A>, A>::with_capacity_in(iovs.len(), alloc);
     let mut dio = align_iov(dio_offset_align, iovs[0]);
 
     for &iov in &iovs[1..] {
@@ -326,6 +327,13 @@ fn prep_dio_list<A: Allocator, F: Fn((u64, usize)) -> (u64, usize)>(
             dio.1 += new_read_size;
         } else {
             dio_list.push(dio);
+            io_buffers.push(
+                IoBuffer::new(
+                    Layout::from_size_align(dio.1, dio_mem_align).unwrap(),
+                    alloc,
+                )
+                .unwrap(),
+            );
             dio = if diov.0 >= dio_end {
                 diov
             } else {
@@ -333,8 +341,16 @@ fn prep_dio_list<A: Allocator, F: Fn((u64, usize)) -> (u64, usize)>(
             };
         }
     }
+    dio_list.push(dio);
+    io_buffers.push(
+        IoBuffer::new(
+            Layout::from_size_align(dio.1, dio_mem_align).unwrap(),
+            alloc,
+        )
+        .unwrap(),
+    );
 
-    dio_list
+    (dio_list, io_buffers)
 }
 
 // iovs [(x0, x1), (x2, x3), (x4, x5)]
@@ -343,14 +359,63 @@ fn prep_dio_list<A: Allocator, F: Fn((u64, usize)) -> (u64, usize)>(
 //
 
 #[must_use = "streams do nothing unless polled"]
-pub struct ReadStream<'file, 'iovs, A: Allocator> {
-    file: &'file DioFile,
-    running_iovs: &'iovs [(u64, usize)],
-    buf: IoBuffer<A>,
-    io_queue: Vec<squeue::Entry, A>,
-    running_io: String,
-    return_queue: VecDeque<Option<IoBufferView<A>>, A>,
-    _non_send: PhantomData<*mut ()>,
+pub enum ReadStream<'file, A: Allocator + Unpin + Copy> {
+    Prep {
+        file: &'file DioFile,
+        iovs: Vec<(u64, usize), A>,
+        concurrency: usize,
+        max_single_read_size: usize,
+        max_merge_len: u64,
+        alloc: A,
+        _non_send: PhantomData<*mut ()>,
+    },
+}
+
+impl<'file, A: Allocator + Unpin + Copy> Stream for ReadStream<'file, A> {
+    type Item = IoBufferView<A>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let fut = self.get_mut();
+
+        match fut {
+            ReadStream::Prep {
+                file,
+                iovs,
+                concurrency,
+                max_single_read_size,
+                max_merge_len,
+                alloc,
+                ..
+            } => {
+                if iovs.is_empty() {
+                    return Poll::Ready(None);
+                }
+
+                iovs.sort_unstable_by_key(|iov| iov.0);
+
+                let (dio_list, io_buffers) = prep_dio_list(
+                    iovs,
+                    file.dio_offset_align,
+                    file.dio_mem_align,
+                    *max_merge_len,
+                    *max_single_read_size,
+                    *alloc,
+                );
+
+                let mut io_map =
+                    VecMap::<slab::Key, (u64, usize), A>::with_capacity_in(*concurrency, *alloc);
+                let mut outputs =
+                    VecMap::<slab::Key, IoBufferView<A>, A>::with_capacity_in(iovs.len(), *alloc);
+
+                for &iov in iovs.iter() {}
+            }
+        }
+
+        todo!()
+    }
 }
 
 fn align_up(v: u64, align: u64) -> u64 {
