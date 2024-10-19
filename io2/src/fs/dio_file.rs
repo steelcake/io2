@@ -279,7 +279,7 @@ impl DioFile {
 
     pub fn read_stream<'file, 'iovs, A: Allocator + Copy>(
         &self,
-        iovs: &[(u64, usize)],
+        iovs: Vec<(u64, usize), A>,
         concurrency: usize,
         max_single_read_size: usize,
         max_merge_len: u64,
@@ -289,16 +289,27 @@ impl DioFile {
             todo!();
         }
 
-        let mut dio_list = Vec::<(u64, usize), A>::with_capacity_in(16, alloc);
+        let mut iovs = iovs;
+        iovs.sort_unstable_by_key(|v| v.0);
+
+        todo!()
+    }
+
+    fn prep_dio_list<A: Allocator>(&self, iovs: &[(u64, usize)], max_merge_len: u64, max_single_read_size: usize, alloc: A) -> Vec<(u64, usize), A> {
+        let mut dio_list = Vec::<(u64, usize), A>::with_capacity_in(iovs.len(), alloc);
         let mut dio = self.align_iov(iovs[0]);
 
-        for &iov in iovs.iter().skip(1) {
+        for &iov in &iovs[1..] {
             let diov = self.align_iov(iov);
             let diov_end = diov.0 + u64::try_from(diov.1).unwrap();
 
             let dio_end = dio.0 + u64::try_from(dio.1).unwrap();
 
-            let extra_read_size = usize::try_from(diov_end.checked_sub(dio_end).unwrap()).unwrap();
+            if diov_end <= dio_end {
+                continue;
+            }
+
+            let extra_read_size = usize::try_from(diov_end - dio_end).unwrap();
             let new_read_size = dio.1 + extra_read_size;
 
             if diov_end <= dio_end + max_merge_len && new_read_size <= max_single_read_size {
@@ -312,8 +323,8 @@ impl DioFile {
                 };
             }
         }
-
-        todo!()
+        
+        dio_list
     }
 }
 
@@ -323,7 +334,7 @@ impl DioFile {
 //
 
 #[must_use = "streams do nothing unless polled"]
-struct ReadStream<'file, 'iovs, A: Allocator> {
+pub struct ReadStream<'file, 'iovs, A: Allocator> {
     file: &'file DioFile,
     running_iovs: &'iovs [(u64, usize)],
     buf: IoBuffer<A>,
