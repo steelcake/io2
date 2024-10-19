@@ -1,17 +1,26 @@
 use std::{
-    alloc::{Allocator, Layout}, collections::VecDeque, future::Future, io, marker::PhantomData, path::Path
+    alloc::{Allocator, Layout},
+    collections::VecDeque,
+    future::Future,
+    io,
+    marker::PhantomData,
+    path::Path,
+    rc::Weak,
 };
 
 use io_uring::squeue;
 
-use crate::{io_buffer::{IoBuffer, IoBufferView}, slab};
+use crate::{
+    io_buffer::{IoBuffer, IoBufferView},
+    slab,
+};
 
 use super::file::{Close, File, Read, SyncAll, Write};
 
 pub struct DioFile {
     file: File,
-    dio_mem_align: u32,
-    dio_offset_align: u32,
+    dio_offset_align: u64,
+    dio_mem_align: usize,
 }
 
 impl DioFile {
@@ -19,16 +28,17 @@ impl DioFile {
         let file = File::open(path, flags | libc::O_DIRECT, mode)?.await?;
         let statx = file.statx().await?;
 
-        if statx.stx_dio_mem_align == 0 || statx.stx_dio_offset_align == 0 {
+        let dio_mem_align = usize::try_from(statx.stx_dio_mem_align).unwrap();
+        let dio_offset_align = u64::from(statx.stx_dio_offset_align);
+
+        if dio_mem_align == 0 || dio_offset_align == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "direct_io is not supported on this file, kernel might be old, or the file might be on an unsupported file system",
             ));
         }
 
-        if !statx.stx_dio_mem_align.is_power_of_two()
-            || !statx.stx_dio_offset_align.is_power_of_two()
-        {
+        if !dio_mem_align.is_power_of_two() || !dio_offset_align.is_power_of_two() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "at least one of direct_io alignment requirements returned by statx is not a power of two",
@@ -37,16 +47,27 @@ impl DioFile {
 
         Ok(DioFile {
             file,
-            dio_mem_align: statx.stx_dio_mem_align,
-            dio_offset_align: statx.stx_dio_offset_align,
+            dio_mem_align,
+            dio_offset_align,
         })
     }
 
-    pub fn dio_mem_align(&self) -> u32 {
+    pub fn align_iov(&self, (offset, size): (u64, usize)) -> (u64, usize) {
+        (
+            align_down(offset, self.dio_offset_align),
+            usize::try_from(align_up(
+                u64::try_from(size).unwrap(),
+                self.dio_offset_align,
+            ))
+            .unwrap(),
+        )
+    }
+
+    pub fn dio_mem_align(&self) -> usize {
         self.dio_mem_align
     }
 
-    pub fn dio_offset_align(&self) -> u32 {
+    pub fn dio_offset_align(&self) -> u64 {
         self.dio_offset_align
     }
 
@@ -63,14 +84,8 @@ impl DioFile {
     }
 
     fn assert_alignment(&self, buf: &[u8], offset: u64) {
-        assert_eq!(
-            buf.as_ptr()
-                .align_offset(usize::try_from(self.dio_mem_align).unwrap()),
-            0
-        );
-        let len = u32::try_from(buf.len()).unwrap();
-        assert_eq!(align_up(len, self.dio_offset_align), len);
-        assert_eq!(align_down(offset, u64::from(self.dio_offset_align)), offset);
+        let iov = (offset, buf.len());
+        assert_eq!(self.align_iov(iov), iov);
     }
 
     pub fn read_aligned<'file, 'buf>(
@@ -133,16 +148,7 @@ impl DioFile {
         offset: u64,
         alloc: A,
     ) -> io::Result<()> {
-        let write_offset = align_down(offset, u64::from(self.dio_offset_align));
-        let write_size = usize::try_from(align_up(
-            u32::try_from(buf.len()).unwrap(),
-            self.dio_offset_align,
-        ))
-        .unwrap();
-
-        if write_offset == offset && write_size == buf.len() {
-            return self.write_all_aligned(buf, offset).await;
-        }
+        let (write_offset, write_size) = self.align_iov((offset, buf.len()));
 
         let layout =
             Layout::from_size_align(write_size, usize::try_from(self.dio_mem_align).unwrap())
@@ -182,12 +188,8 @@ impl DioFile {
         size: usize,
         alloc: A,
     ) -> io::Result<IoBufferView<A>> {
-        let read_offset = align_down(offset, u64::from(self.dio_offset_align));
-        let read_size = usize::try_from(align_up(
-            u32::try_from(size).unwrap(),
-            self.dio_offset_align,
-        ))
-        .unwrap();
+        let (read_offset, read_size) = self.align_iov((offset, size));
+
         let view_start = usize::try_from(offset.checked_sub(read_offset).unwrap()).unwrap();
         let view_len = size;
 
@@ -230,12 +232,8 @@ impl DioFile {
         size: usize,
         alloc: A,
     ) -> io::Result<IoBufferView<A>> {
-        let read_offset = align_down(offset, u64::from(self.dio_offset_align));
-        let read_size = usize::try_from(align_up(
-            u32::try_from(size).unwrap(),
-            self.dio_offset_align,
-        ))
-        .unwrap();
+        let (read_offset, read_size) = self.align_iov((offset, size));
+
         let view_start = usize::try_from(offset.checked_sub(read_offset).unwrap()).unwrap();
         let view_len = size;
 
@@ -248,8 +246,9 @@ impl DioFile {
         let mut total_read = 0;
         let mut retry: Option<usize> = None;
 
-        let min_offset_increment =
-            usize::try_from(self.dio_offset_align.max(self.dio_mem_align)).unwrap();
+        let min_offset_increment = usize::try_from(self.dio_offset_align)
+            .unwrap()
+            .max(self.dio_mem_align);
 
         loop {
             match self.read_aligned(buf_slice, read_offset).await {
@@ -278,18 +277,39 @@ impl DioFile {
         Ok(buf.view(view_start, view_len))
     }
 
-    pub fn read_stream<'file, 'iovs, A: Allocator, IOVS: Iterator<Item=(u64, usize)>>(&self, iovs: IOVS, concurrency: usize, max_single_read_size: u64, alloc: A) -> ReadStream<'file, 'iovs, A> {
-        let mut io_queue = Vec::<(u64, usize), A>::with_capacity_in(128, alloc);
-        let mut io: Option<(u64, usize)> = None;
+    pub fn read_stream<'file, 'iovs, A: Allocator + Copy>(
+        &self,
+        iovs: &[(u64, usize)],
+        concurrency: usize,
+        max_single_read_size: usize,
+        max_merge_len: u64,
+        alloc: A,
+    ) -> ReadStream<'file, 'iovs, A> {
+        if iovs.is_empty() {
+            todo!();
+        }
 
-        for iov in iovs {
-            assert!(iov.0 >= io.0 + u64::try_from(io.1).unwrap());
-            assert!(iov.1 > 0);
+        let mut dio_list = Vec::<(u64, usize), A>::with_capacity_in(16, alloc);
+        let mut dio = self.align_iov(iovs[0]);
 
-            if io.0.checked_sub(iov.0).unwrap() <= max_single_read_size {
+        for &iov in iovs.iter().skip(1) {
+            let diov = self.align_iov(iov);
+            let diov_end = diov.0 + u64::try_from(diov.1).unwrap();
 
-            } else if io != (0, 0) {
-                io_queue.push(io);
+            let dio_end = dio.0 + u64::try_from(dio.1).unwrap();
+
+            let extra_read_size = usize::try_from(diov_end.checked_sub(dio_end).unwrap()).unwrap();
+            let new_read_size = dio.1 + extra_read_size;
+
+            if diov_end <= dio_end + max_merge_len && new_read_size <= max_single_read_size {
+                dio.1 += new_read_size;
+            } else {
+                dio_list.push(dio);
+                dio = if diov.0 >= dio_end {
+                    diov
+                } else {
+                    (dio_end, extra_read_size)
+                };
             }
         }
 
@@ -300,7 +320,7 @@ impl DioFile {
 // iovs [(x0, x1), (x2, x3), (x4, x5)]
 // actual reads [(z0, z1), (z2, z3)]
 // when read0 finishes return first two iovs
-// 
+//
 
 #[must_use = "streams do nothing unless polled"]
 struct ReadStream<'file, 'iovs, A: Allocator> {
@@ -313,7 +333,7 @@ struct ReadStream<'file, 'iovs, A: Allocator> {
     _non_send: PhantomData<*mut ()>,
 }
 
-fn align_up(v: u32, align: u32) -> u32 {
+fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
 
