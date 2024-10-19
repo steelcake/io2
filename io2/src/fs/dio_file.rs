@@ -52,17 +52,6 @@ impl DioFile {
         })
     }
 
-    pub fn align_iov(&self, (offset, size): (u64, usize)) -> (u64, usize) {
-        (
-            align_down(offset, self.dio_offset_align),
-            usize::try_from(align_up(
-                u64::try_from(size).unwrap(),
-                self.dio_offset_align,
-            ))
-            .unwrap(),
-        )
-    }
-
     pub fn dio_mem_align(&self) -> usize {
         self.dio_mem_align
     }
@@ -85,7 +74,7 @@ impl DioFile {
 
     fn assert_alignment(&self, buf: &[u8], offset: u64) {
         let iov = (offset, buf.len());
-        assert_eq!(self.align_iov(iov), iov);
+        assert_eq!(align_iov(self.dio_offset_align, iov), iov);
     }
 
     pub fn read_aligned<'file, 'buf>(
@@ -148,7 +137,7 @@ impl DioFile {
         offset: u64,
         alloc: A,
     ) -> io::Result<()> {
-        let (write_offset, write_size) = self.align_iov((offset, buf.len()));
+        let (write_offset, write_size) = align_iov(self.dio_offset_align, (offset, buf.len())); 
 
         let layout =
             Layout::from_size_align(write_size, usize::try_from(self.dio_mem_align).unwrap())
@@ -188,7 +177,7 @@ impl DioFile {
         size: usize,
         alloc: A,
     ) -> io::Result<IoBufferView<A>> {
-        let (read_offset, read_size) = self.align_iov((offset, size));
+        let (read_offset, read_size) = align_iov(self.dio_offset_align, (offset, size));
 
         let view_start = usize::try_from(offset.checked_sub(read_offset).unwrap()).unwrap();
         let view_len = size;
@@ -232,7 +221,7 @@ impl DioFile {
         size: usize,
         alloc: A,
     ) -> io::Result<IoBufferView<A>> {
-        let (read_offset, read_size) = self.align_iov((offset, size));
+        let (read_offset, read_size) = align_iov(self.dio_offset_align, (offset, size));
 
         let view_start = usize::try_from(offset.checked_sub(read_offset).unwrap()).unwrap();
         let view_len = size;
@@ -294,38 +283,58 @@ impl DioFile {
 
         todo!()
     }
+}
 
-    fn prep_dio_list<A: Allocator>(&self, iovs: &[(u64, usize)], max_merge_len: u64, max_single_read_size: usize, alloc: A) -> Vec<(u64, usize), A> {
-        let mut dio_list = Vec::<(u64, usize), A>::with_capacity_in(iovs.len(), alloc);
-        let mut dio = self.align_iov(iovs[0]);
+fn align_iov(
+    dio_offset_align: u64,
+    (offset, size): (u64, usize),
+) -> (u64, usize) {
+    (
+        align_down(offset, dio_offset_align),
+        usize::try_from(align_up(
+            u64::try_from(size).unwrap(),
+            dio_offset_align,
+        ))
+        .unwrap(),
+    )
+}
 
-        for &iov in &iovs[1..] {
-            let diov = self.align_iov(iov);
-            let diov_end = diov.0 + u64::try_from(diov.1).unwrap();
+fn prep_dio_list<A: Allocator, F: Fn((u64, usize)) -> (u64, usize)>(
+    iovs: &[(u64, usize)],
+    dio_offset_align: u64,
+    max_merge_len: u64,
+    max_single_read_size: usize,
+    alloc: A,
+) -> Vec<(u64, usize), A> {
+    let mut dio_list = Vec::<(u64, usize), A>::with_capacity_in(iovs.len(), alloc);
+    let mut dio = align_iov(dio_offset_align, iovs[0]);
 
-            let dio_end = dio.0 + u64::try_from(dio.1).unwrap();
+    for &iov in &iovs[1..] {
+        let diov = align_iov(dio_offset_align, iov);
+        let diov_end = diov.0 + u64::try_from(diov.1).unwrap();
 
-            if diov_end <= dio_end {
-                continue;
-            }
+        let dio_end = dio.0 + u64::try_from(dio.1).unwrap();
 
-            let extra_read_size = usize::try_from(diov_end - dio_end).unwrap();
-            let new_read_size = dio.1 + extra_read_size;
-
-            if diov_end <= dio_end + max_merge_len && new_read_size <= max_single_read_size {
-                dio.1 += new_read_size;
-            } else {
-                dio_list.push(dio);
-                dio = if diov.0 >= dio_end {
-                    diov
-                } else {
-                    (dio_end, extra_read_size)
-                };
-            }
+        if diov_end <= dio_end {
+            continue;
         }
-        
-        dio_list
+
+        let extra_read_size = usize::try_from(diov_end - dio_end).unwrap();
+        let new_read_size = dio.1 + extra_read_size;
+
+        if diov_end <= dio_end + max_merge_len && new_read_size <= max_single_read_size {
+            dio.1 += new_read_size;
+        } else {
+            dio_list.push(dio);
+            dio = if diov.0 >= dio_end {
+                diov
+            } else {
+                (dio_end, extra_read_size)
+            };
+        }
     }
+
+    dio_list
 }
 
 // iovs [(x0, x1), (x2, x3), (x4, x5)]
