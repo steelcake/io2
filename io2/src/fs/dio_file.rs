@@ -10,9 +10,10 @@ use std::{
 };
 
 use futures_core::Stream;
-use io_uring::squeue;
+use io_uring::{opcode, squeue, types::Fd};
 
 use crate::{
+    executor::CURRENT_TASK_CONTEXT,
     io_buffer::{IoBuffer, IoBufferView},
     slab,
     vecmap::VecMap,
@@ -283,6 +284,7 @@ impl DioFile {
             concurrency,
             max_single_read_size,
             max_merge_len,
+            dio_mem_align: self.dio_mem_align,
             alloc,
             _non_send: PhantomData,
         }
@@ -350,6 +352,7 @@ pub enum ReadStream<'file, A: Allocator + Unpin + Copy> {
         concurrency: usize,
         max_single_read_size: usize,
         max_merge_len: u64,
+        dio_mem_align: usize,
         alloc: A,
         _non_send: PhantomData<*mut ()>,
     },
@@ -357,13 +360,15 @@ pub enum ReadStream<'file, A: Allocator + Unpin + Copy> {
         file: &'file DioFile,
         iovs: Vec<(u64, usize), A>,
         io_map: VecMap<slab::Key, ((u64, usize), IoBuffer<A>), A>,
+        io_res: Vec<(slab::Key, i32), A>,
+        dio_mem_align: usize,
         alloc: A,
     },
     Empty,
 }
 
 impl<'file, A: Allocator + Unpin + Copy> Stream for ReadStream<'file, A> {
-    type Item = IoBufferView<A>;
+    type Item = io::Result<IoBufferView<A>>;
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
@@ -371,49 +376,88 @@ impl<'file, A: Allocator + Unpin + Copy> Stream for ReadStream<'file, A> {
     ) -> Poll<Option<Self::Item>> {
         let fut = self.get_mut();
 
-        loop {
-            match std::mem::replace(fut, ReadStream::Empty) {
-                ReadStream::Prep {
-                    file,
-                    mut iovs,
-                    concurrency,
-                    max_single_read_size,
-                    max_merge_len,
-                    alloc,
-                    ..
-                } => {
-                    if iovs.is_empty() {
-                        return Poll::Ready(None);
-                    }
-
-                    iovs.sort_unstable_by_key(|iov| iov.0);
-
-                    let mut dio_list = prep_dio_list(
-                        &iovs,
-                        file.dio_offset_align,
-                        max_merge_len,
+        CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+            let ctx = ctx.as_mut().unwrap();
+            loop {
+                match std::mem::replace(fut, ReadStream::Empty) {
+                    ReadStream::Prep {
+                        file,
+                        mut iovs,
+                        concurrency,
                         max_single_read_size,
+                        max_merge_len,
                         alloc,
-                    );
+                        dio_mem_align,
+                        ..
+                    } => {
+                        if iovs.is_empty() {
+                            return Poll::Ready(None);
+                        }
 
-                    let mut io_map =
-                        VecMap::<slab::Key, ((u64, usize), IoBuffer<A>), A>::with_capacity_in(
-                            concurrency,
+                        iovs.sort_unstable_by_key(|iov| iov.0);
+
+                        let mut dio_list = prep_dio_list(
+                            &iovs,
+                            file.dio_offset_align,
+                            max_merge_len,
+                            max_single_read_size,
                             alloc,
                         );
 
-                    for _ in 0..concurrency {
-                        if let Some(dio) = dio_list.pop_front() {
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                ReadStream::Empty => return Poll::Ready(None),
-            }
-        }
+                        let mut io_map =
+                            VecMap::<slab::Key, ((u64, usize), IoBuffer<A>), A>::with_capacity_in(
+                                concurrency,
+                                alloc,
+                            );
 
-        todo!()
+                        for _ in 0..concurrency {
+                            if let Some(dio) = dio_list.pop_front() {
+                                let mut buf = IoBuffer::new(
+                                    Layout::from_size_align(dio.1, dio_mem_align).unwrap(),
+                                    alloc,
+                                )
+                                .unwrap();
+                                let buf_slice = buf.as_mut_slice();
+                                let io_id = unsafe {
+                                    ctx.queue_io(
+                                        opcode::Read::new(
+                                            Fd(file.file.fd),
+                                            buf_slice.as_mut_ptr(),
+                                            u32::try_from(buf_slice.len()).unwrap(),
+                                        )
+                                        .offset(dio.0)
+                                        .build(),
+                                        true,
+                                    )
+                                };
+                                io_map.insert(io_id, (dio, buf));
+                            } else {
+                                break;
+                            }
+                        }
+
+                        let io_res = Vec::with_capacity_in(concurrency, alloc);
+
+                        *fut = ReadStream::Running { file, iovs, io_map, dio_mem_align, io_res, alloc };
+                    }
+                    ReadStream::Running { file, mut iovs, mut io_map, dio_mem_align, alloc, mut io_res } => {
+                        for &io_id in io_map.iter_keys() {
+                            if let Some(res) = ctx.take_io_result(io_id) {
+                                io_res.push((io_id, res));
+                            }
+                        }
+
+                        for (io_id, res) in io_res.iter() {
+                            io_map.remove(io_id);
+                        }
+                        io_res.clear();
+
+                        todo!()
+                    }
+                    ReadStream::Empty => return Poll::Ready(None),
+                }
+            }
+        })
     }
 }
 
