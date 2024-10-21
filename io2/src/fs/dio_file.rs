@@ -1,23 +1,4 @@
-use std::{
-    alloc::{Allocator, Layout},
-    collections::VecDeque,
-    future::Future,
-    io,
-    marker::PhantomData,
-    path::Path,
-    rc::Weak,
-    task::Poll,
-};
-
-use futures_core::Stream;
-use io_uring::{opcode, squeue, types::Fd};
-
-use crate::{
-    executor::CURRENT_TASK_CONTEXT,
-    io_buffer::{IoBuffer, IoBufferView},
-    slab,
-    vecmap::VecMap,
-};
+use std::{io, marker::PhantomData, path::Path};
 
 use super::file::{Close, File, Read, SyncAll, Write};
 
@@ -133,7 +114,8 @@ fn align_down(v: u64, align: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{executor::ExecutorConfig, local_alloc::LocalAlloc};
+    use crate::{executor::ExecutorConfig, io_buffer::IoBuffer, local_alloc::LocalAlloc};
+    use std::alloc::Layout;
 
     use super::*;
 
@@ -146,9 +128,15 @@ mod tests {
                     .unwrap();
                 let size = file.file_size().await.unwrap();
                 let size = usize::try_from(size).unwrap();
+                let iov = align_iov(file.dio_offset_align(), (0, size));
+                let mut buf = IoBuffer::<LocalAlloc>::new(
+                    Layout::from_size_align(iov.1, file.dio_mem_align()).unwrap(),
+                    LocalAlloc::new(),
+                )
+                .unwrap();
                 let start = std::time::Instant::now();
-                let buf = file.read_exact(0, size, LocalAlloc::new()).await.unwrap();
-                assert_eq!(buf.len(), size);
+                let n_read = file.read_aligned(buf.as_mut_slice(), 0).await.unwrap();
+                assert_eq!(n_read, size);
                 println!("{}", std::str::from_utf8(buf.as_slice()).unwrap());
                 println!("delay {}ns", start.elapsed().as_nanos());
                 5

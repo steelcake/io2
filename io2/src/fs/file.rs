@@ -1,4 +1,3 @@
-use std::alloc::Allocator;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
