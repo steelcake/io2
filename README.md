@@ -1,5 +1,7 @@
 # io2
 
+`This library is not ready for use`
+
 io library
 
 ## Requirements for Direct-IO usage
