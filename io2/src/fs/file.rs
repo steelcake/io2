@@ -1,6 +1,6 @@
-use std::alloc::Allocator;
+use std::ffi::CString;
 use std::future::Future;
-use std::io;
+use std::io::{self, ErrorKind};
 use std::marker::PhantomData;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -13,7 +13,6 @@ use io_uring::types::Fd;
 use pin_project_lite::pin_project;
 
 use crate::executor::{CURRENT_TASK_CONTEXT, FILES_TO_CLOSE};
-use crate::local_alloc::LocalAlloc;
 use crate::slab;
 
 pub struct File {
@@ -64,7 +63,7 @@ impl Future for Close {
 pin_project! {
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     pub struct Open {
-        path: LocalCString,
+        path: CString,
         #[pin] how: libc::open_how,
         io_id: Option<slab::Key>,
         _non_send: PhantomData<*mut ()>,
@@ -84,7 +83,7 @@ impl Future for Open {
                         ctx.queue_io(
                             opcode::OpenAt2::new(
                                 Fd(libc::AT_FDCWD),
-                                fut.path.as_c_str(),
+                                fut.path.as_ptr(),
                                 &*fut.how as *const libc::open_how as *const _,
                             )
                             .build(),
@@ -127,7 +126,7 @@ pub struct Read<'file, 'buf> {
     pub(crate) _non_send: PhantomData<*mut ()>,
 }
 
-impl<'file, 'buf> Future for Read<'file, 'buf> {
+impl Future for Read<'_, '_> {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -179,7 +178,7 @@ pub struct Write<'file, 'buf> {
     pub(crate) _non_send: PhantomData<*mut ()>,
 }
 
-impl<'file, 'buf> Future for Write<'file, 'buf> {
+impl Future for Write<'_, '_> {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -237,7 +236,7 @@ fn empty_path() -> *const libc::c_char {
     &EMPTY_PATH as *const u8 as *const libc::c_char
 }
 
-impl<'file> Future for Statx<'file> {
+impl Future for Statx<'_> {
     type Output = io::Result<libc::statx>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -287,7 +286,7 @@ pub struct SyncAll<'file> {
     _non_send: PhantomData<*mut ()>,
 }
 
-impl<'file> Future for SyncAll<'file> {
+impl Future for SyncAll<'_> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -320,39 +319,10 @@ impl<'file> Future for SyncAll<'file> {
     }
 }
 
-// This is because std CString doesn't support allocator api
-struct LocalCString {
-    path: Vec<u8, LocalAlloc>,
-}
-
-impl LocalCString {
-    fn from_path(path: &Path) -> io::Result<Self> {
-        let path_ref = path.as_os_str().as_bytes();
-
-        if path_ref.contains(&b'\0') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "null value in path",
-            ));
-        }
-
-        let mut path = Vec::with_capacity_in(path_ref.len() + 1, LocalAlloc::new());
-        // Safety: this is safe because next lines can't panic, and we write up to the new length.
-        unsafe { path.set_len(path_ref.len() + 1) };
-        path[..path_ref.len()].copy_from_slice(path_ref);
-        path[path_ref.len()] = b'\0';
-
-        Ok(Self { path })
-    }
-
-    fn as_c_str(&self) -> *const libc::c_char {
-        self.path.as_ptr() as *const libc::c_char
-    }
-}
-
 impl File {
     pub fn open(path: &Path, flags: i32, mode: i32) -> io::Result<Open> {
-        let path = LocalCString::from_path(path)?;
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
         how.flags = flags as u64;
         how.mode = mode as u64;
@@ -372,53 +342,6 @@ impl File {
             io_id: None,
             direct_io: false,
             _non_send: PhantomData,
-        }
-    }
-
-    pub async fn write_all(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        let mut offset = offset;
-        let mut buf = buf;
-
-        while !buf.is_empty() {
-            match self.write(buf, offset).await {
-                Ok(0) => {
-                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-                }
-                Ok(n) => {
-                    buf = &buf[n..];
-                    offset += u64::try_from(n).unwrap();
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn read_exact<'file, 'buf>(
-        &'file self,
-        buf: &'buf mut [u8],
-        offset: u64,
-    ) -> io::Result<()> {
-        let mut offset = offset;
-        let mut buf = buf;
-
-        while !buf.is_empty() {
-            match self.read(buf, offset).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    buf = &mut buf[n..];
-                    offset += u64::try_from(n).unwrap();
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        if !buf.is_empty() {
-            Err(io::Error::from(io::ErrorKind::UnexpectedEof))
-        } else {
-            Ok(())
         }
     }
 
@@ -472,14 +395,6 @@ impl Drop for File {
             files.push(self.fd);
         });
     }
-}
-
-pub async fn read<A: Allocator>(path: &Path, alloc: A) -> io::Result<Vec<u8, A>> {
-    let file = File::open(path, libc::O_RDONLY, 0)?.await?;
-    let file_size = file.file_size().await?;
-    let mut buf = Vec::with_capacity_in(usize::try_from(file_size).unwrap(), alloc);
-    file.read_exact(&mut buf, 0).await?;
-    Ok(buf)
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 use std::{
+    alloc::Global as GlobalAlloc,
     cell::RefCell,
     collections::VecDeque,
     future::Future,
@@ -12,31 +13,31 @@ use std::{
 
 use io_uring::{cqueue, opcode, squeue, types::Fd, IoUring};
 
-use crate::{local_alloc::LocalAlloc, slab, vecmap::VecMap};
+use crate::{slab, vecmap::VecMap};
 
 thread_local! {
     pub(crate) static CURRENT_TASK_CONTEXT: RefCell<Option<CurrentTaskContext>> = const { RefCell::new(None) };
-    pub(crate) static FILES_TO_CLOSE: RefCell<Vec<RawFd, LocalAlloc>> = RefCell::new(Vec::with_capacity_in(128, LocalAlloc::new()));
+    pub(crate) static FILES_TO_CLOSE: RefCell<Vec<RawFd>> = RefCell::new(Vec::with_capacity(128));
 }
 
-type IoResults = VecMap<slab::Key, i32, LocalAlloc>;
-type ToNotify = VecMap<slab::Key, (), LocalAlloc>;
-type Task = Pin<Box<dyn Future<Output = ()>, LocalAlloc>>;
+type IoResults = VecMap<slab::Key, i32>;
+type ToNotify = VecMap<slab::Key, ()>;
+type Task = Pin<Box<dyn Future<Output = ()>>>;
 
 struct NotifyWhen {
-    timer: Vec<Instant, LocalAlloc>,
-    task_id: Vec<slab::Key, LocalAlloc>,
+    timer: Vec<Instant>,
+    task_id: Vec<slab::Key>,
 }
 
 pub(crate) struct CurrentTaskContext {
     start: Instant,
     task_id: slab::Key,
-    tasks: *mut slab::Slab<Task, LocalAlloc>,
+    tasks: *mut slab::Slab<Task>,
     io_results: *mut IoResults,
-    io_queue: *mut VecDeque<squeue::Entry, LocalAlloc>,
-    dio_queue: *mut VecDeque<squeue::Entry, LocalAlloc>,
+    io_queue: *mut VecDeque<squeue::Entry>,
+    dio_queue: *mut VecDeque<squeue::Entry>,
     preempt_duration: Duration,
-    io: *mut slab::Slab<slab::Key, LocalAlloc>,
+    io: *mut slab::Slab<slab::Key>,
     to_notify: *mut ToNotify,
     notify_when: *mut NotifyWhen,
     num_dio_running: *mut usize,
@@ -85,19 +86,16 @@ impl CurrentTaskContext {
         &mut self,
         future: F,
     ) -> JoinHandle<T> {
-        let out = Rc::pin_in(RefCell::new(None), LocalAlloc::new());
+        let out = Rc::pin(RefCell::new(None));
         let join_handle = JoinHandle { out: out.clone() };
         let caller_task_id = self.task_id;
-        let task = Box::pin_in(
-            async move {
-                *out.borrow_mut() = Some(future.await);
-                CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
-                    let ctx = ctx.as_mut().unwrap();
-                    ctx.notify(caller_task_id);
-                });
-            },
-            LocalAlloc::new(),
-        );
+        let task = Box::pin(async move {
+            *out.borrow_mut() = Some(future.await);
+            CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
+                let ctx = ctx.as_mut().unwrap();
+                ctx.notify(caller_task_id);
+            });
+        });
 
         let task_id = unsafe { (*self.tasks).insert(task) };
         self.notify(task_id);
@@ -193,14 +191,11 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 
     let mut out = Option::<T>::None;
     let out_ptr = &mut out as *mut Option<T>;
-    let task = Box::pin_in(
-        async move {
-            unsafe {
-                *out_ptr = Some(future.await);
-            }
-        },
-        LocalAlloc::new(),
-    );
+    let task = Box::pin(async move {
+        unsafe {
+            *out_ptr = Some(future.await);
+        }
+    });
 
     let waker = noop_waker();
     let mut poll_ctx = Context::from_waker(&waker);
@@ -217,23 +212,21 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
         .setup_iopoll()
         .build(ring_depth)?;
 
-    let mut tasks = slab::Slab::<Task, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
-    let mut io = slab::Slab::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
-    let mut io_queue =
-        VecDeque::<squeue::Entry, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
-    let mut dio_queue =
-        VecDeque::<squeue::Entry, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
+    let mut tasks = slab::Slab::<Task>::with_capacity_in(128, GlobalAlloc);
+    let mut io = slab::Slab::<slab::Key>::with_capacity_in(128, GlobalAlloc);
+    let mut io_queue = VecDeque::<squeue::Entry>::with_capacity(128);
+    let mut dio_queue = VecDeque::<squeue::Entry>::with_capacity(128);
     let mut io_results =
-        IoResults::with_capacity_in(usize::try_from(ring_depth).unwrap() * 4, LocalAlloc::new());
-    let mut to_notify = ToNotify::with_capacity_in(128, LocalAlloc::new());
-    let mut notifying = Vec::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new());
+        IoResults::with_capacity_in(usize::try_from(ring_depth).unwrap() * 4, GlobalAlloc);
+    let mut to_notify = ToNotify::with_capacity_in(128, GlobalAlloc);
+    let mut notifying = Vec::<slab::Key>::with_capacity(128);
     let mut notify_when = NotifyWhen {
-        timer: Vec::<Instant, LocalAlloc>::with_capacity_in(128, LocalAlloc::new()),
-        task_id: Vec::<slab::Key, LocalAlloc>::with_capacity_in(128, LocalAlloc::new()),
+        timer: Vec::<Instant>::with_capacity(128),
+        task_id: Vec::<slab::Key>::with_capacity(128),
     };
     let mut num_dio_running = 0usize;
 
-    let close_file_task_id = tasks.insert(Box::pin_in(async {}, LocalAlloc::new()));
+    let close_file_task_id = tasks.insert(Box::pin(async {}));
     let close_file_io_id = io.insert(close_file_task_id);
     let mut files_closing = 0usize;
 
@@ -375,7 +368,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     Ok(out.unwrap())
 }
 
-fn notify_timers(notify_when: &mut NotifyWhen, to_notify: &mut VecMap<slab::Key, (), LocalAlloc>) {
+fn notify_timers(notify_when: &mut NotifyWhen, to_notify: &mut VecMap<slab::Key, ()>) {
     let time = Instant::now();
     let mut i = 0;
     loop {
@@ -394,11 +387,7 @@ fn notify_timers(notify_when: &mut NotifyWhen, to_notify: &mut VecMap<slab::Key,
     }
 }
 
-fn try_submit_io(
-    io_queue: &mut VecDeque<squeue::Entry, LocalAlloc>,
-    ring: &mut IoUring,
-    force_submit: bool,
-) {
+fn try_submit_io(io_queue: &mut VecDeque<squeue::Entry>, ring: &mut IoUring, force_submit: bool) {
     let (submitter, mut sq, _) = ring.split();
 
     while !io_queue.is_empty() {
@@ -478,7 +467,7 @@ impl Future for YieldIfNeeded {
 }
 
 pub struct JoinHandle<T> {
-    out: Pin<Rc<RefCell<Option<T>>, LocalAlloc>>,
+    out: Pin<Rc<RefCell<Option<T>>>>,
 }
 
 impl<T> Future for JoinHandle<T> {

@@ -1,18 +1,11 @@
-use std::{
-    alloc::{Allocator, Layout},
-    io,
-    marker::PhantomData,
-    path::Path,
-};
-
-use crate::io_buffer::{IoBuffer, IoBufferView};
+use std::{io, marker::PhantomData, path::Path};
 
 use super::file::{Close, File, Read, SyncAll, Write};
 
 pub struct DioFile {
     file: File,
-    dio_mem_align: u32,
-    dio_offset_align: u32,
+    dio_offset_align: u64,
+    dio_mem_align: usize,
 }
 
 impl DioFile {
@@ -20,16 +13,17 @@ impl DioFile {
         let file = File::open(path, flags | libc::O_DIRECT, mode)?.await?;
         let statx = file.statx().await?;
 
-        if statx.stx_dio_mem_align == 0 || statx.stx_dio_offset_align == 0 {
+        let dio_mem_align = usize::try_from(statx.stx_dio_mem_align).unwrap();
+        let dio_offset_align = u64::from(statx.stx_dio_offset_align);
+
+        if dio_mem_align == 0 || dio_offset_align == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "direct_io is not supported on this file, kernel might be old, or the file might be on an unsupported file system",
             ));
         }
 
-        if !statx.stx_dio_mem_align.is_power_of_two()
-            || !statx.stx_dio_offset_align.is_power_of_two()
-        {
+        if !dio_mem_align.is_power_of_two() || !dio_offset_align.is_power_of_two() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "at least one of direct_io alignment requirements returned by statx is not a power of two",
@@ -38,16 +32,16 @@ impl DioFile {
 
         Ok(DioFile {
             file,
-            dio_mem_align: statx.stx_dio_mem_align,
-            dio_offset_align: statx.stx_dio_offset_align,
+            dio_mem_align,
+            dio_offset_align,
         })
     }
 
-    pub fn dio_mem_align(&self) -> u32 {
+    pub fn dio_mem_align(&self) -> usize {
         self.dio_mem_align
     }
 
-    pub fn dio_offset_align(&self) -> u32 {
+    pub fn dio_offset_align(&self) -> u64 {
         self.dio_offset_align
     }
 
@@ -64,14 +58,8 @@ impl DioFile {
     }
 
     fn assert_alignment(&self, buf: &[u8], offset: u64) {
-        assert_eq!(
-            buf.as_ptr()
-                .align_offset(usize::try_from(self.dio_mem_align).unwrap()),
-            0
-        );
-        let len = u32::try_from(buf.len()).unwrap();
-        assert_eq!(align_up(len, self.dio_offset_align), len);
-        assert_eq!(align_down(offset, u64::from(self.dio_offset_align)), offset);
+        let iov = (offset, buf.len());
+        assert_eq!(align_iov(self.dio_offset_align, iov), iov);
     }
 
     pub fn read_aligned<'file, 'buf>(
@@ -107,180 +95,16 @@ impl DioFile {
             _non_send: PhantomData,
         }
     }
-
-    pub async fn write_all_aligned(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        let mut retry: Option<usize> = None;
-        loop {
-            match self.write_aligned(buf, offset).await {
-                Ok(n) => {
-                    if n < buf.len() {
-                        if retry == Some(n) {
-                            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-                        }
-                        retry = Some(n);
-                    } else {
-                        return Ok(());
-                    }
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    pub async fn write_all<A: Allocator>(
-        &self,
-        buf: &[u8],
-        offset: u64,
-        alloc: A,
-    ) -> io::Result<()> {
-        let write_offset = align_down(offset, u64::from(self.dio_offset_align));
-        let write_size = usize::try_from(align_up(
-            u32::try_from(buf.len()).unwrap(),
-            self.dio_offset_align,
-        ))
-        .unwrap();
-
-        if write_offset == offset && write_size == buf.len() {
-            return self.write_all_aligned(buf, offset).await;
-        }
-
-        let layout =
-            Layout::from_size_align(write_size, usize::try_from(self.dio_mem_align).unwrap())
-                .unwrap();
-        let mut write_buf = IoBuffer::new(layout, alloc).unwrap();
-
-        let start_diff = offset.checked_sub(write_offset).unwrap();
-        if start_diff > 0 {
-            self.read_exact_aligned(
-                &mut write_buf.as_mut_slice()[..usize::try_from(self.dio_offset_align).unwrap()],
-                write_offset,
-            )
-            .await?;
-        }
-
-        let end_diff = (write_offset + u64::try_from(write_size).unwrap())
-            .checked_sub(offset + u64::try_from(buf.len()).unwrap())
-            .unwrap();
-        if end_diff > 0 {
-            self.read_exact_aligned(
-                &mut write_buf.as_mut_slice()[usize::try_from(end_diff).unwrap()..],
-                write_offset + end_diff,
-            )
-            .await?;
-        }
-
-        let start_diff = usize::try_from(start_diff).unwrap();
-        write_buf.as_mut_slice()[start_diff..start_diff + buf.len()].copy_from_slice(buf);
-
-        self.write_all_aligned(write_buf.as_slice(), write_offset)
-            .await
-    }
-
-    pub async fn read<A: Allocator>(
-        &self,
-        offset: u64,
-        size: usize,
-        alloc: A,
-    ) -> io::Result<IoBufferView<A>> {
-        let read_offset = align_down(offset, u64::from(self.dio_offset_align));
-        let read_size = usize::try_from(align_up(
-            u32::try_from(size).unwrap(),
-            self.dio_offset_align,
-        ))
-        .unwrap();
-        let view_start = usize::try_from(offset.checked_sub(read_offset).unwrap()).unwrap();
-        let view_len = size;
-
-        let layout =
-            Layout::from_size_align(read_size, usize::try_from(self.dio_mem_align).unwrap())
-                .unwrap();
-        let mut buf = IoBuffer::new(layout, alloc).unwrap();
-
-        let n_read = self.read_aligned(buf.as_mut_slice(), read_offset).await?;
-        let n_read_in_range = n_read.saturating_sub(view_start);
-
-        let view = buf.view(view_start, view_len.min(n_read_in_range));
-
-        Ok(view)
-    }
-
-    pub async fn read_exact_aligned(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        let mut retry: Option<usize> = None;
-        loop {
-            match self.read_aligned(buf, offset).await {
-                Ok(n) => {
-                    if n < buf.len() {
-                        if retry == Some(n) {
-                            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-                        }
-                        retry = Some(n);
-                    } else {
-                        return Ok(());
-                    }
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    pub async fn read_exact<A: Allocator>(
-        &self,
-        offset: u64,
-        size: usize,
-        alloc: A,
-    ) -> io::Result<IoBufferView<A>> {
-        let read_offset = align_down(offset, u64::from(self.dio_offset_align));
-        let read_size = usize::try_from(align_up(
-            u32::try_from(size).unwrap(),
-            self.dio_offset_align,
-        ))
-        .unwrap();
-        let view_start = usize::try_from(offset.checked_sub(read_offset).unwrap()).unwrap();
-        let view_len = size;
-
-        let layout =
-            Layout::from_size_align(read_size, usize::try_from(self.dio_mem_align).unwrap())
-                .unwrap();
-        let mut buf = IoBuffer::new(layout, alloc).unwrap();
-        let mut buf_slice = buf.as_mut_slice();
-        let mut read_offset = read_offset;
-        let mut total_read = 0;
-        let mut retry: Option<usize> = None;
-
-        let min_offset_increment =
-            usize::try_from(self.dio_offset_align.max(self.dio_mem_align)).unwrap();
-
-        loop {
-            match self.read_aligned(buf_slice, read_offset).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if total_read + n >= view_start + view_len {
-                        break;
-                    }
-                    if n >= min_offset_increment {
-                        total_read += min_offset_increment;
-                        buf_slice = &mut buf_slice[min_offset_increment..];
-                        read_offset += u64::try_from(min_offset_increment).unwrap();
-                        retry = None;
-                    } else {
-                        if retry == Some(n) {
-                            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-                        }
-                        retry = Some(n);
-                    }
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        Ok(buf.view(view_start, view_len))
-    }
 }
 
-fn align_up(v: u32, align: u32) -> u32 {
+fn align_iov(dio_offset_align: u64, (offset, size): (u64, usize)) -> (u64, usize) {
+    (
+        align_down(offset, dio_offset_align),
+        usize::try_from(align_up(u64::try_from(size).unwrap(), dio_offset_align)).unwrap(),
+    )
+}
+
+fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
 
@@ -290,7 +114,8 @@ fn align_down(v: u64, align: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{executor::ExecutorConfig, local_alloc::LocalAlloc};
+    use crate::{executor::ExecutorConfig, io_buffer::IoBuffer};
+    use std::alloc::Layout;
 
     use super::*;
 
@@ -303,9 +128,15 @@ mod tests {
                     .unwrap();
                 let size = file.file_size().await.unwrap();
                 let size = usize::try_from(size).unwrap();
+                let iov = align_iov(file.dio_offset_align(), (0, size));
+                let mut buf = IoBuffer::<std::alloc::Global>::new(
+                    Layout::from_size_align(iov.1, file.dio_mem_align()).unwrap(),
+                    std::alloc::Global,
+                )
+                .unwrap();
                 let start = std::time::Instant::now();
-                let buf = file.read_exact(0, size, LocalAlloc::new()).await.unwrap();
-                assert_eq!(buf.len(), size);
+                let n_read = file.read_aligned(buf.as_mut_slice(), 0).await.unwrap();
+                assert_eq!(n_read, size);
                 println!("{}", std::str::from_utf8(buf.as_slice()).unwrap());
                 println!("delay {}ns", start.elapsed().as_nanos());
                 5

@@ -1,6 +1,6 @@
 use std::alloc::Allocator;
 
-pub struct VecMap<K: PartialEq, V, A: Allocator + Copy> {
+pub struct VecMap<K: PartialEq, V, A: Allocator + Copy = std::alloc::Global> {
     keys: Vec<K, A>,
     values: Vec<V, A>,
 }
