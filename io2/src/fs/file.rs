@@ -1,5 +1,6 @@
+use std::ffi::CString;
 use std::future::Future;
-use std::io;
+use std::io::{self, ErrorKind};
 use std::marker::PhantomData;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -12,7 +13,6 @@ use io_uring::types::Fd;
 use pin_project_lite::pin_project;
 
 use crate::executor::{CURRENT_TASK_CONTEXT, FILES_TO_CLOSE};
-use crate::local_alloc::LocalAlloc;
 use crate::slab;
 
 pub struct File {
@@ -63,7 +63,7 @@ impl Future for Close {
 pin_project! {
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     pub struct Open {
-        path: LocalCString,
+        path: CString,
         #[pin] how: libc::open_how,
         io_id: Option<slab::Key>,
         _non_send: PhantomData<*mut ()>,
@@ -83,7 +83,7 @@ impl Future for Open {
                         ctx.queue_io(
                             opcode::OpenAt2::new(
                                 Fd(libc::AT_FDCWD),
-                                fut.path.as_c_str(),
+                                fut.path.as_ptr(),
                                 &*fut.how as *const libc::open_how as *const _,
                             )
                             .build(),
@@ -319,39 +319,10 @@ impl<'file> Future for SyncAll<'file> {
     }
 }
 
-// This is because std CString doesn't support allocator api
-struct LocalCString {
-    path: Vec<u8, LocalAlloc>,
-}
-
-impl LocalCString {
-    fn from_path(path: &Path) -> io::Result<Self> {
-        let path_ref = path.as_os_str().as_bytes();
-
-        if path_ref.contains(&b'\0') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "null value in path",
-            ));
-        }
-
-        let mut path = Vec::with_capacity_in(path_ref.len() + 1, LocalAlloc::new());
-        // Safety: this is safe because next lines can't panic, and we write up to the new length.
-        unsafe { path.set_len(path_ref.len() + 1) };
-        path[..path_ref.len()].copy_from_slice(path_ref);
-        path[path_ref.len()] = b'\0';
-
-        Ok(Self { path })
-    }
-
-    fn as_c_str(&self) -> *const libc::c_char {
-        self.path.as_ptr() as *const libc::c_char
-    }
-}
-
 impl File {
     pub fn open(path: &Path, flags: i32, mode: i32) -> io::Result<Open> {
-        let path = LocalCString::from_path(path)?;
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
         how.flags = flags as u64;
         how.mode = mode as u64;

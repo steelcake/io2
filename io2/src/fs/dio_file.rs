@@ -114,7 +114,7 @@ fn align_down(v: u64, align: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{executor::ExecutorConfig, io_buffer::IoBuffer, local_alloc::LocalAlloc};
+    use crate::{executor::ExecutorConfig, io_buffer::IoBuffer};
     use std::alloc::Layout;
 
     use super::*;
@@ -129,9 +129,9 @@ mod tests {
                 let size = file.file_size().await.unwrap();
                 let size = usize::try_from(size).unwrap();
                 let iov = align_iov(file.dio_offset_align(), (0, size));
-                let mut buf = IoBuffer::<LocalAlloc>::new(
+                let mut buf = IoBuffer::<std::alloc::Global>::new(
                     Layout::from_size_align(iov.1, file.dio_mem_align()).unwrap(),
-                    LocalAlloc::new(),
+                    std::alloc::Global,
                 )
                 .unwrap();
                 let start = std::time::Instant::now();

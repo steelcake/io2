@@ -1,6 +1,6 @@
 use std::alloc::Allocator;
 
-pub struct Slab<T, A: Allocator> {
+pub struct Slab<T, A: Allocator = std::alloc::Global> {
     elems: Vec<Entry<T>, A>,
     first_free_entry: u32,
     current_generation: u32,
