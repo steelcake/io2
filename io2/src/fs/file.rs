@@ -126,7 +126,7 @@ pub struct Read<'file, 'buf> {
     pub(crate) _non_send: PhantomData<*mut ()>,
 }
 
-impl<'file, 'buf> Future for Read<'file, 'buf> {
+impl Future for Read<'_, '_> {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -178,7 +178,7 @@ pub struct Write<'file, 'buf> {
     pub(crate) _non_send: PhantomData<*mut ()>,
 }
 
-impl<'file, 'buf> Future for Write<'file, 'buf> {
+impl Future for Write<'_, '_> {
     type Output = io::Result<usize>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -236,7 +236,7 @@ fn empty_path() -> *const libc::c_char {
     &EMPTY_PATH as *const u8 as *const libc::c_char
 }
 
-impl<'file> Future for Statx<'file> {
+impl Future for Statx<'_> {
     type Output = io::Result<libc::statx>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -286,7 +286,7 @@ pub struct SyncAll<'file> {
     _non_send: PhantomData<*mut ()>,
 }
 
-impl<'file> Future for SyncAll<'file> {
+impl Future for SyncAll<'_> {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
