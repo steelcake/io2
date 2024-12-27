@@ -24,6 +24,15 @@ type IoResults = VecMap<slab::Key, i32>;
 type ToNotify = VecMap<slab::Key, ()>;
 type Task = Pin<Box<dyn Future<Output = ()>>>;
 
+struct TaskEntry {
+    num_io: usize,
+    /// None if the task finished running. This is useful if
+    /// we have io running in the uring when the task was prematurely cancelled.
+    /// We keep a ref count ('num_io') of running io so we don't remove the task entry
+    /// from our map prematurely, this can cause UB if we don't do this.
+    task: Option<Task>,
+}
+
 struct NotifyWhen {
     timer: Vec<Instant>,
     task_id: Vec<slab::Key>,
@@ -32,7 +41,7 @@ struct NotifyWhen {
 pub(crate) struct CurrentTaskContext {
     start: Instant,
     task_id: slab::Key,
-    tasks: *mut slab::Slab<Task>,
+    tasks: *mut slab::Slab<TaskEntry>,
     io_results: *mut IoResults,
     io_queue: *mut VecDeque<squeue::Entry>,
     dio_queue: *mut VecDeque<squeue::Entry>,
@@ -66,6 +75,10 @@ impl CurrentTaskContext {
             match (*self.io_results).remove(&io_id) {
                 Some(res) => {
                     (*self.io).remove(io_id);
+                    {
+                        let task = (*self.tasks).get_mut(self.task_id).unwrap();
+                        task.num_io = task.num_io.checked_sub(1).unwrap();
+                    }
                     Some(res)
                 }
                 None => None,
@@ -97,7 +110,12 @@ impl CurrentTaskContext {
             });
         });
 
-        let task_id = unsafe { (*self.tasks).insert(task) };
+        let task_id = unsafe {
+            (*self.tasks).insert(TaskEntry {
+                task: Some(task),
+                num_io: 0,
+            })
+        };
         self.notify(task_id);
         join_handle
     }
@@ -106,10 +124,11 @@ impl CurrentTaskContext {
     /// So it is safe to include pinned pointers to self when building the squeue entry.
     ///
     /// Safety: Caller must make sure the squeue entry is valid as long as the caller future is pinned.
-    /// Caller future should not return Poll::Ready before all io is complete because the executor will
-    /// drop the future if it returns Poll::Ready and this might invalidate some io operation it queued
-    /// while it is running in the kernel.
     pub(crate) unsafe fn queue_io(&mut self, entry: squeue::Entry, direct_io: bool) -> slab::Key {
+        {
+            let task = (*self.tasks).get_mut(self.task_id).unwrap();
+            task.num_io = task.num_io.checked_add(1).unwrap();
+        }
         let io_id = (*self.io).insert(self.task_id);
         let entry = entry.user_data(io_id.into());
         let queue = if direct_io {
@@ -212,7 +231,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
         .setup_iopoll()
         .build(ring_depth)?;
 
-    let mut tasks = slab::Slab::<Task>::with_capacity_in(128, GlobalAlloc);
+    let mut tasks = slab::Slab::<TaskEntry>::with_capacity_in(128, GlobalAlloc);
     let mut io = slab::Slab::<slab::Key>::with_capacity_in(128, GlobalAlloc);
     let mut io_queue = VecDeque::<squeue::Entry>::with_capacity(128);
     let mut dio_queue = VecDeque::<squeue::Entry>::with_capacity(128);
@@ -226,11 +245,17 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     };
     let mut num_dio_running = 0usize;
 
-    let close_file_task_id = tasks.insert(Box::pin(async {}));
+    let close_file_task_id = tasks.insert(TaskEntry {
+        num_io: 0,
+        task: Some(Box::pin(async {})),
+    });
     let close_file_io_id = io.insert(close_file_task_id);
     let mut files_closing = 0usize;
 
-    let task_id = tasks.insert(task);
+    let task_id = tasks.insert(TaskEntry {
+        task: Some(task),
+        num_io: 0,
+    });
     to_notify.insert(task_id, ());
 
     while out.is_none() || files_closing > 0 || FILES_TO_CLOSE.with_borrow(|x| !x.is_empty()) {
@@ -301,9 +326,10 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                         num_dio_running: &mut num_dio_running,
                     });
                 });
-                let poll_result = tasks
-                    .get_mut(task_id)
-                    .map(|task| task.as_mut().poll(&mut poll_ctx));
+                let poll_result = tasks.get_mut(task_id).map(|task| match task.task.as_mut() {
+                    Some(task) => task.as_mut().poll(&mut poll_ctx),
+                    None => Poll::Ready(()),
+                });
                 if task_start.elapsed() > preempt_duration {
                     log::warn!("a task is using too much cpu time, this might cause other tasks to starve. calling yield_if_needed() more frequently should fix this.");
                 }
@@ -317,7 +343,11 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                 match poll_result {
                     Poll::Pending => {}
                     Poll::Ready(_) => {
-                        std::mem::drop(tasks.remove(task_id));
+                        let task = tasks.get_mut(task_id).unwrap();
+                        task.task = None;
+                        if task.num_io == 0 {
+                            tasks.remove(task_id);
+                        }
                     }
                 }
 
@@ -345,6 +375,12 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                 continue;
             }
             let task_id = *io.get(io_id).unwrap();
+
+            let task = tasks.get_mut(task_id).unwrap();
+            if task.task.is_none() {
+                task.num_io = task.num_io.checked_sub(1).unwrap();
+            }
+
             io_results.insert(io_id, cqe.result());
             to_notify.insert(task_id, ());
         }
