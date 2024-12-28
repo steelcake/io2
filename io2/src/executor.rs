@@ -25,12 +25,13 @@ type ToNotify = VecMap<slab::Key, ()>;
 type Task = Pin<Box<dyn Future<Output = ()>>>;
 
 struct TaskEntry {
+    // number of IO that is currently running in io_uring
     num_io: usize,
-    /// None if the task finished running. This is useful if
-    /// we have io running in the uring when the task was prematurely cancelled.
-    /// We keep a ref count ('num_io') of running io so we don't remove the task entry
-    /// from our map prematurely, this can cause UB if we don't do this.
-    task: Option<Task>,
+    // finished io
+    finished_io: Vec<slab::Key>,
+    // false if the task finished it's execution
+    finished: bool,
+    task: Task,
 }
 
 struct NotifyWhen {
@@ -74,11 +75,12 @@ impl CurrentTaskContext {
         unsafe {
             match (*self.io_results).remove(&io_id) {
                 Some(res) => {
-                    (*self.io).remove(io_id);
                     {
                         let task = (*self.tasks).get_mut(self.task_id).unwrap();
-                        task.num_io = task.num_io.checked_sub(1).unwrap();
+                        let idx = task.finished_io.iter().position(|&id| id == io_id).unwrap();
+                        task.finished_io.swap_remove(idx);
                     }
+                    (*self.io).remove(io_id);
                     Some(res)
                 }
                 None => None,
@@ -112,8 +114,10 @@ impl CurrentTaskContext {
 
         let task_id = unsafe {
             (*self.tasks).insert(TaskEntry {
-                task: Some(task),
+                task,
                 num_io: 0,
+                finished_io: Vec::new(),
+                finished: false,
             })
         };
         self.notify(task_id);
@@ -247,14 +251,18 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
 
     let close_file_task_id = tasks.insert(TaskEntry {
         num_io: 0,
-        task: Some(Box::pin(async {})),
+        task: Box::pin(async {}),
+        finished: false,
+        finished_io: Vec::new(),
     });
     let close_file_io_id = io.insert(close_file_task_id);
     let mut files_closing = 0usize;
 
     let task_id = tasks.insert(TaskEntry {
-        task: Some(task),
+        task,
         num_io: 0,
+        finished: false,
+        finished_io: Vec::new(),
     });
     to_notify.insert(task_id, ());
 
@@ -326,27 +334,51 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                         num_dio_running: &mut num_dio_running,
                     });
                 });
-                let poll_result = tasks.get_mut(task_id).map(|task| match task.task.as_mut() {
-                    Some(task) => task.as_mut().poll(&mut poll_ctx),
-                    None => Poll::Ready(()),
-                });
+                let poll_result = {
+                    let task_ref = match tasks.get_mut(task_id) {
+                        Some(task_ref) => task_ref,
+                        None => continue,
+                    };
+                    if !task_ref.finished {
+                        task_ref.task.as_mut().poll(&mut poll_ctx)
+                    } else {
+                        Poll::Ready(())
+                    }
+                };
                 if task_start.elapsed() > preempt_duration {
                     log::warn!("a task is using too much cpu time, this might cause other tasks to starve. calling yield_if_needed() more frequently should fix this.");
                 }
                 CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
                     let _ = ctx.take().unwrap();
                 });
-                let poll_result = match poll_result {
-                    Some(p) => p,
-                    None => continue,
-                };
                 match poll_result {
                     Poll::Pending => {}
                     Poll::Ready(_) => {
                         let task = tasks.get_mut(task_id).unwrap();
-                        task.task = None;
+                        // set finished marker so this task is not polled again
+                        // we still want it alive and the memory intact because it might
+                        // have given pointers of itself to io_uring, we want to wait for
+                        // the io_uring entries to finish running before destroying/modifying the
+                        // memory of the task at all
+                        task.finished = true;
+
+                        // If there is no io remaning in the uring, we should clean everything
+                        // relating to this task and finally destroy it.
+                        // If there is remaning IO, the io_uring cqe handling loop will do the
+                        // cleanup.
                         if task.num_io == 0 {
-                            tasks.remove(task_id);
+                            let task = tasks.remove(task_id).unwrap();
+                            for io_id in task.finished_io {
+                                io.remove(io_id).unwrap();
+                            }
+
+                            // Not deleting the notification won't cause UB. Only thing that
+                            // can happen is we remove this task. Another task is spawned and is
+                            // assigned the same id. Some later task in the loop intends to notify
+                            // this task but ends up notifying the new task instead.
+                            //
+                            // This is all fine since notifying random tasks for no reason is ok.
+                            to_notify.remove(&task_id);
                         }
                     }
                 }
@@ -376,13 +408,31 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
             }
             let task_id = *io.get(io_id).unwrap();
 
-            let task = tasks.get_mut(task_id).unwrap();
-            if task.task.is_none() {
-                task.num_io = task.num_io.checked_sub(1).unwrap();
-            }
-
             io_results.insert(io_id, cqe.result());
             to_notify.insert(task_id, ());
+
+            let task = tasks.get_mut(task_id).unwrap();
+            task.num_io = task.num_io.checked_sub(1).unwrap();
+            task.finished_io.push(io_id);
+
+            // If task had already finished execution and we have io coming out of uring,
+            // we need to check if there are any remaning io in the uring and delete the task
+            // completely if there is no io remaning in uring. Doing this when there is remaning io
+            // in the uring is unsafe.
+            //
+            // Doing this here is not really needed since the task will be notified and the
+            // poll loop will check it and delete the resources when it realises there is no
+            // pending io on it and it finished execution.
+            // But we do it here anyways to short circuit and not waste more time on this.
+            //
+            // TODO: it is smart to refactor this into a function to not repeat it two times.
+            if task.finished && task.num_io == 0 {
+                let task = tasks.remove(task_id).unwrap();
+                for io_id in task.finished_io {
+                    io.remove(io_id).unwrap();
+                }
+                to_notify.remove(&task_id);
+            }
         }
 
         notify_timers(&mut notify_when, &mut to_notify);
