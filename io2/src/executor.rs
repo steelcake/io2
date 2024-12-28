@@ -1,3 +1,52 @@
+//! This module implements the `Executor`
+//!
+//! # Executor
+//!
+//! `Executor` is the main runner of the async system. It handles timers, file io, network io (TODO),
+//! and channels (TODO) all in a single threaded way.
+//!
+//! `Executor` does all of the book keeping between io operations, tasks, timers and other objects
+//! using local data structures.
+//!
+//! It runs the async tasks, submits io to uring and handles completion events from uring. It also
+//! runs timers, channels etc. while doing this.
+//!
+//! # Waker and compatibility
+//!
+//! It explicitly does not support `Waker` API. All async operations are tied to executor so
+//! they won't work in other async runtimes and other async libraries very likely won't work with executor
+//! because it doesn't support `Waker` API.
+//!
+//! # direct_io
+//!
+//! `Executor` uses a seperate uring instance for direct_io to use `iopoll` feature which means we need to
+//! drive the io manually with syscalls in place of interrupt driven IO. This is for better
+//! latency and throughput.
+//!
+//! # Implementing low level async tasks using `CURRENT_TASK_CONTEXT`
+//!
+//! `Executor` initializes a thread local variable named `CURRENT_TASK_CONTEXT` before polling
+//! async tasks. Tasks can access io, timers, channels etc. through this interface. And downstream
+//! tasks can then use these tasks for implementing higher level operations.
+//!
+//! # Co-operative thread-per-core scheduling
+//!
+//! With this model, the user is expected to run ALL operations inside the async tasks. Even
+//! compute intensive CPU hogging operations.
+//!
+//! The idea is to call `yield_if_needed` frequently while doing such operations so it doesn't
+//! block the thread that much.
+//!
+//! This means we don't need to juggle background threads etc. and don't need to send data over to
+//! other threads.
+//!
+//! For example if we are reading some data and then decompressing it, we want to call
+//! `yield_if_needed` after decompressing each chunk, if it is possible for the decompression to
+//! take milliseconds. If it is microseconds/nanoseconds it probably is ok.
+//!
+//! The idea is to make everything run more efficient by reducing communication overhead between
+//! threads.
+
 use std::{
     alloc::Global as GlobalAlloc,
     cell::RefCell,
@@ -146,6 +195,8 @@ impl CurrentTaskContext {
     }
 
     pub(crate) fn notify_when(&mut self, when: Instant) {
+        // don't need to keep the task alive as long as the timer since
+        // notifying random tasks is always ok. So it is fine if timer goes off after the task is destroyed.
         unsafe {
             let n = &mut *self.notify_when;
             n.timer.push(when);
@@ -156,8 +207,8 @@ impl CurrentTaskContext {
 
 /// Spawns a future to run in the background.
 ///
-/// This should only be used if the future to be spawned is doing significant CPU work,
-/// otherwise it is recommended to just nest it into the current future using mechanisms like `futures::future::join` and similar.
+/// By default it is recommended to just nest the future into the current task using mechanisms like `futures::future::join` and similar.
+/// This API is only recommended if that option is not available.
 pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(future: F) -> JoinHandle<T> {
     CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
         let ctx = ctx.as_mut().unwrap();
@@ -530,7 +581,7 @@ const fn noop_raw_waker() -> RawWaker {
 }
 
 #[inline]
-pub fn noop_waker() -> Waker {
+fn noop_waker() -> Waker {
     unsafe { Waker::from_raw(noop_raw_waker()) }
 }
 
@@ -550,6 +601,10 @@ impl Future for YieldIfNeeded {
             }
         })
     }
+}
+
+pub fn yield_if_needed() -> YieldIfNeeded {
+    YieldIfNeeded
 }
 
 pub struct JoinHandle<T> {
