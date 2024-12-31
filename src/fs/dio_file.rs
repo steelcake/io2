@@ -62,6 +62,10 @@ impl DioFile {
         assert_eq!(align_iov(self.dio_offset_align, iov), iov);
     }
 
+    pub fn align_iov(&self, iov: (u64, usize)) -> (u64, usize) {
+        align_iov(self.dio_offset_align(), iov)
+    }
+
     pub fn read_aligned<'file, 'buf>(
         &'file self,
         buf: &'buf mut [u8],
@@ -97,7 +101,7 @@ impl DioFile {
     }
 }
 
-fn align_iov(dio_offset_align: u64, (offset, size): (u64, usize)) -> (u64, usize) {
+pub fn align_iov(dio_offset_align: u64, (offset, size): (u64, usize)) -> (u64, usize) {
     (
         align_down(offset, dio_offset_align),
         usize::try_from(align_up(u64::try_from(size).unwrap(), dio_offset_align)).unwrap(),

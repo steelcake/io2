@@ -60,6 +60,7 @@ impl<A: Allocator> IoBufferView<A> {
         assert!(buf.layout.size() >= offset + len);
         Self { buf, offset, len }
     }
+
     pub fn as_slice(&self) -> &[u8] {
         assert!(self.buf.layout.size() >= self.offset + self.len);
         unsafe { std::slice::from_raw_parts(self.buf.ptr.add(self.offset).as_ptr(), self.len) }
