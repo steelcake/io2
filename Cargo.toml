@@ -1,9 +1,12 @@
-[workspace]
-resolver = "2"
+[package]
+name = "io2"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "single threaded async-io library"
 
-members = ["io2"]
-
-[profile.maxperf]
-inherits = "release"
-lto = true
-codegen-units = 1
+[dependencies]
+io-uring = "0.7"
+libc = "0.2"
+pin-project-lite = "0.2"
+log = "0.4"

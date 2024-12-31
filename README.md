@@ -1,8 +1,11 @@
 # io2
 
-`This library is not ready for use`
-
 io library
+
+This library gives a single threaded async executor that uses io_uring under the hood.
+It supports polled (not interrupt driven) direct_io for disk io for minimum latency and maximum throughput.
+
+Main priorities are simplicity, stability and efficiency.
 
 ## Requirements for Direct-IO usage
 
