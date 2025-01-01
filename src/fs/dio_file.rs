@@ -108,11 +108,11 @@ pub fn align_iov(dio_offset_align: u64, (offset, size): (u64, usize)) -> (u64, u
     )
 }
 
-fn align_up(v: u64, align: u64) -> u64 {
+pub fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
 
-fn align_down(v: u64, align: u64) -> u64 {
+pub fn align_down(v: u64, align: u64) -> u64 {
     v & !(align - 1)
 }
 

@@ -12,7 +12,7 @@ use libfuzzer_sys::{arbitrary, fuzz_target};
 use rand::RngCore;
 
 use io2::executor::{JoinHandle, ExecutorConfig, spawn, yield_if_needed};
-use io2::fs::dio_file::DioFile;
+use io2::fs::dio_file::{align_up, DioFile};
 use io2::fs::file::File;
 use io2::time::sleep;
 use uuid::Uuid;
@@ -89,6 +89,23 @@ async fn run_op(state: &mut State, op: Operation) {
 
             let file = File::open(&make_file_path(), libc::O_RDWR | O_CREAT, 0).unwrap().await.unwrap();
             let dio_file = DioFile::open(&make_file_path(), libc::O_RDWR | O_CREAT, 0).await.unwrap();
+
+            let file_size = align_up(u64::try_from(FILE_SIZE).unwrap(), dio_file.dio_offset_align());
+            let file_size = usize::try_from(file_size).unwrap();
+
+            let mut file_data = IoBuffer::new(
+                Layout::from_size_align(file_size, dio_file.dio_mem_align()).unwrap(),
+                std::alloc::Global,
+            ).unwrap();
+
+            let mut rng = rand::thread_rng();
+            rng.fill_bytes(file_data.as_mut_slice());
+
+            let n = file.write(file_data.as_slice(), 0).await.unwrap();
+            assert_eq!(n, file_size);
+
+            let n = dio_file.write_aligned(file_data.as_slice(), 0).await.unwrap();
+            assert_eq!(n, file_size);
 
             state.files.push(file);
             state.dio_files.push(dio_file);
@@ -170,6 +187,7 @@ async fn run_op(state: &mut State, op: Operation) {
             file.write(buf.as_slice(), iov.0).await.unwrap();
         },
         Operation::Sleep { time } => {
+            let time = time.min(Duration::from_micros(100));
             sleep(time).await;
         },
         Operation::Spawn { ops } => {
