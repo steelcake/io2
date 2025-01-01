@@ -3,6 +3,9 @@
 #![no_main]
 
 use std::alloc::Layout;
+use std::cell::RefCell;
+use std::mem::MaybeUninit;
+use std::rc::Rc;
 use std::time::Duration;
 use std::path::PathBuf;
 
@@ -15,17 +18,9 @@ use io2::executor::{JoinHandle, ExecutorConfig, spawn, yield_if_needed};
 use io2::fs::dio_file::{align_up, DioFile};
 use io2::fs::file::File;
 use io2::time::sleep;
-use uuid::Uuid;
 
 #[derive(Clone, Debug, arbitrary::Arbitrary)]
 enum Operation {
-    Open,
-    Close {
-        file_index: usize,
-    },
-    Drop {
-        file_index: usize,
-    },
     Read {
         file_index: usize,
         offset: u64,
@@ -61,38 +56,52 @@ fn make_iov(dio_file: &DioFile, file_size: u64, offset: u64, size: usize) -> (u6
     dio_file.align_iov(iov)
 }
 
-#[derive(Default)]
-struct State {
-    files: Vec<File>,
-    dio_files: Vec<DioFile>,
+struct InnerState {
+    files: [Rc<File>; NUM_FILES],
+    dio_files: [Rc<DioFile>; NUM_FILES],
     tasks: Vec<JoinHandle<()>>,
-    num_files_created: usize,
 }
 
-const MAX_NUM_FILES: usize = 16;
-const FILE_SIZE: usize = 1 << 27;
+struct State {
+    inner: Rc<RefCell<InnerState>>,
+}
 
-fn make_file_path() -> PathBuf {
-    let mut path = PathBuf::from("data");
-    path.push(Uuid::new_v4().to_string());
+impl State {
+    fn get_mut<'a>(&'a self) -> std::cell::RefMut<'a, InnerState> {
+        RefCell::borrow_mut(&self.inner)
+    }
+}
+
+const NUM_FILES: usize = 16;
+const FILE_SIZE: usize = 1 << 27; // 128 MB
+
+fn make_file_path(file_name: &str) -> PathBuf {
+    let mut path = PathBuf::from("./data");
+    path.push(file_name);
     path
 }
 
-async fn run_op(state: &mut State, op: Operation) {
-    match op {
-        Operation::Open => {
-            if state.num_files_created >= MAX_NUM_FILES {
-                return;
-            }
+async fn open_files() -> ([Rc<File>; NUM_FILES], [Rc<DioFile>; NUM_FILES]) {
+    let mut name_letter = 'a' as u8;
 
-            state.num_files_created += 1;
+    let mut files: [MaybeUninit<Rc<File>>; NUM_FILES] = [const { MaybeUninit::uninit() }; NUM_FILES]; 
+    let mut dio_files: [MaybeUninit<Rc<DioFile>>; NUM_FILES] = [const { MaybeUninit::uninit() }; NUM_FILES]; 
+    for index in 0..NUM_FILES {
+        let file_name = format!("{}", name_letter);
+        let dio_file_name = format!("{}_dio", name_letter);
+        name_letter += 1;
 
-            let file = File::open(&make_file_path(), libc::O_RDWR | O_CREAT, 0).unwrap().await.unwrap();
-            let dio_file = DioFile::open(&make_file_path(), libc::O_RDWR | O_CREAT, 0).await.unwrap();
+        let file_p = make_file_path(&file_name);
+        let file = File::open(&file_p, libc::O_RDWR | O_CREAT, 0o666).unwrap().await.unwrap();
+        let dio_file = DioFile::open(&make_file_path(&dio_file_name), libc::O_RDWR | O_CREAT, 0o666).await.unwrap();
 
-            let file_size = align_up(u64::try_from(FILE_SIZE).unwrap(), dio_file.dio_offset_align());
-            let file_size = usize::try_from(file_size).unwrap();
+        let file_size = align_up(u64::try_from(FILE_SIZE).unwrap(), dio_file.dio_offset_align());
+        let file_size = usize::try_from(file_size).unwrap();
 
+        let current_file_size = file.file_size().await.unwrap();
+        if current_file_size > 0 {
+            assert_eq!(current_file_size, u64::try_from(FILE_SIZE).unwrap());
+        } else {
             let mut file_data = IoBuffer::new(
                 Layout::from_size_align(file_size, dio_file.dio_mem_align()).unwrap(),
                 std::alloc::Global,
@@ -106,49 +115,40 @@ async fn run_op(state: &mut State, op: Operation) {
 
             let n = dio_file.write_aligned(file_data.as_slice(), 0).await.unwrap();
             assert_eq!(n, file_size);
+        }
 
-            state.files.push(file);
-            state.dio_files.push(dio_file);
-        },
-        Operation::Close { file_index } => {
-            if state.files.is_empty() {
-                return;
-            }
+        files[index].write(Rc::new(file));
+        dio_files[index].write(Rc::new(dio_file));
+    }
+    
+    unsafe {
+        (std::mem::transmute(files), std::mem::transmute(dio_files))
+    }
+}
 
-            let file = state.files.swap_remove(file_index % state.files.len());
-            file.close().await.unwrap();
-
-            let dio_file = state.dio_files.swap_remove(file_index % state.dio_files.len());
-            dio_file.close().await.unwrap();
-        },
-        Operation::Drop { file_index } => {
-            if state.files.is_empty() {
-                return;
-            }
-
-            state.files.swap_remove(file_index % state.files.len());
-            state.dio_files.swap_remove(file_index % state.dio_files.len());
-        },
+async fn run_op(state: &State, op: Operation) {
+    match op {
         Operation::Read { file_index, offset, size } => {
-            if state.files.is_empty() {
+            let this = state.get_mut();
+
+            if this.files.is_empty() {
                 return; 
             }
 
-            let size = size.min(1 << 23);
+            let file = this.files[file_index % this.files.len()].clone();
+            let dio_file = this.dio_files[file_index % this.dio_files.len()].clone();
 
-            let file = &state.files[file_index % state.files.len()];
-            let dio_file = &state.dio_files[file_index % state.dio_files.len()];
+            std::mem::drop(this);
 
             let file_size = file.file_size().await.unwrap();
             assert_eq!(dio_file.file_size().await.unwrap(), file_size);
+            assert_eq!(file_size, u64::try_from(FILE_SIZE).unwrap());
 
-            if file_size == 0 {
-                return;
-            }
+            let offset = offset.min(file_size);
+            let size = size.min(1 << 23);
+            let iov = make_iov(&dio_file, file_size, offset, size);
 
-            let iov = make_iov(dio_file, file_size, offset, size);
-
-            let read_size = iov.1.min(usize::try_from((file_size+1).checked_sub(iov.0).unwrap()).unwrap());
+            let read_size = iov.1.min(usize::try_from((file_size).checked_sub(iov.0).unwrap()).unwrap());
 
             let mut file_buf = vec![0; iov.1];
             let n = file.read(&mut file_buf, iov.0).await.unwrap();
@@ -160,22 +160,30 @@ async fn run_op(state: &mut State, op: Operation) {
             let n = dio_file.read_aligned(dio_file_buf.as_mut_slice(), iov.0).await.unwrap();
             assert_eq!(n, read_size);
 
-            assert_eq!(&dio_file_buf.as_slice()[..read_size], &file_buf.as_slice()[..read_size]);
+            if &dio_file_buf.as_slice()[..read_size] != &file_buf.as_slice()[..read_size] {
+                panic!("read bytes are not equal");
+            }
         },
         Operation::Write { file_index, offset, size } => {
-            if state.files.is_empty() {
+            let this = state.get_mut();
+
+            if this.files.is_empty() {
                 return; 
             }
 
-            let size = size.min(1 << 23); 
+            let file = this.files[file_index % this.files.len()].clone();
+            let dio_file = this.dio_files[file_index % this.dio_files.len()].clone();
 
-            let file = &state.files[file_index % state.files.len()];
-            let dio_file = &state.dio_files[file_index % state.dio_files.len()];
+            std::mem::drop(this);
 
             let file_size = file.file_size().await.unwrap();
             assert_eq!(dio_file.file_size().await.unwrap(), file_size);
+            assert_eq!(file_size, u64::try_from(FILE_SIZE).unwrap());
 
-            let iov = make_iov(dio_file, file_size, offset, size);
+            let offset = offset.min(file_size);
+            let size = size.min(1 << 23);
+            let iov = make_iov(&dio_file, file_size, offset, size);
+            assert!(iov.0 + u64::try_from(iov.1).unwrap() <= file_size);
 
             let layout = Layout::from_size_align(iov.1, dio_file.dio_mem_align()).unwrap();
             let mut buf = IoBuffer::new(layout, std::alloc::Global).unwrap();
@@ -191,8 +199,9 @@ async fn run_op(state: &mut State, op: Operation) {
             sleep(time).await;
         },
         Operation::Spawn { ops } => {
-            state.tasks.push(spawn(async move {
-                let mut inner_state = State::default();
+            let inner = Rc::clone(&state.inner);
+            state.get_mut().tasks.push(spawn(async move {
+                let mut inner_state = State { inner };
 
                 for op in ops {
                     run_op(&mut inner_state, op).await;
@@ -201,11 +210,16 @@ async fn run_op(state: &mut State, op: Operation) {
         },
         Operation::YieldIfNeeded => yield_if_needed().await,
         Operation::Join { task_index } => {
-            if state.tasks.is_empty() {
+            let mut this = state.get_mut();
+
+            if this.tasks.is_empty() {
                 return;
             }
 
-            let handle = state.tasks.swap_remove(task_index % state.tasks.len());
+            let idx = task_index % this.tasks.len();
+            let handle = this.tasks.swap_remove(idx);
+
+            std::mem::drop(this);
 
             handle.await;
         },
@@ -213,7 +227,15 @@ async fn run_op(state: &mut State, op: Operation) {
 }
 
 async fn to_fuzz(operations: Vec<Operation>) {
-    let mut state = State::default(); 
+    let (files, dio_files) = open_files().await;
+        
+    let mut state = State {
+        inner: Rc::new(RefCell::new(InnerState {
+            files,
+            dio_files,
+            tasks: Vec::new(),
+        })),
+    };
 
     for op in operations {
         run_op(&mut state, op).await;
