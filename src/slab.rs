@@ -142,6 +142,6 @@ impl From<u64> for Key {
 
 impl From<Key> for u64 {
     fn from(key: Key) -> Self {
-        key.index as u64 | (key.generation as u64) << 32
+        key.index as u64 | ((key.generation as u64) << 32)
     }
 }

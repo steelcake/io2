@@ -76,10 +76,8 @@ type Task = Pin<Box<dyn Future<Output = ()>>>;
 struct TaskEntry {
     // number of IO that is currently running in io_uring
     num_io: usize,
-    // finished io
     finished_io: Vec<slab::Key>,
-    // false if the task finished it's execution
-    finished: bool,
+    finished_execution: bool,
     task: Task,
 }
 
@@ -166,7 +164,7 @@ impl CurrentTaskContext {
                 task,
                 num_io: 0,
                 finished_io: Vec::new(),
-                finished: false,
+                finished_execution: false,
             })
         };
         self.notify(task_id);
@@ -206,9 +204,6 @@ impl CurrentTaskContext {
 }
 
 /// Spawns a future to run in the background.
-///
-/// By default it is recommended to just nest the future into the current task using mechanisms like `futures::future::join` and similar.
-/// This API is only recommended if that option is not available.
 pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(future: F) -> JoinHandle<T> {
     CURRENT_TASK_CONTEXT.with_borrow_mut(|ctx| {
         let ctx = ctx.as_mut().unwrap();
@@ -303,7 +298,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     let close_file_task_id = tasks.insert(TaskEntry {
         num_io: 0,
         task: Box::pin(async {}),
-        finished: false,
+        finished_execution: false,
         finished_io: Vec::new(),
     });
     let close_file_io_id = io.insert(close_file_task_id);
@@ -312,7 +307,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
     let task_id = tasks.insert(TaskEntry {
         task,
         num_io: 0,
-        finished: false,
+        finished_execution: false,
         finished_io: Vec::new(),
     });
     to_notify.insert(task_id, ());
@@ -390,7 +385,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                         Some(task_ref) => task_ref,
                         None => continue,
                     };
-                    if !task_ref.finished {
+                    if !task_ref.finished_execution {
                         task_ref.task.as_mut().poll(&mut poll_ctx)
                     } else {
                         Poll::Ready(())
@@ -411,7 +406,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
                         // have given pointers of itself to io_uring, we want to wait for
                         // the io_uring entries to finish running before destroying/modifying the
                         // memory of the task at all
-                        task.finished = true;
+                        task.finished_execution = true;
 
                         // If there is no io remaning in the uring, we should clean everything
                         // relating to this task and finally destroy it.
@@ -477,7 +472,7 @@ fn run<T: 'static, F: Future<Output = T> + 'static>(
             // But we do it here anyways to short circuit and not waste more time on this.
             //
             // TODO: it is smart to refactor this into a function to not repeat it two times.
-            if task.finished && task.num_io == 0 {
+            if task.finished_execution && task.num_io == 0 {
                 let task = tasks.remove(task_id).unwrap();
                 for io_id in task.finished_io {
                     io.remove(io_id).unwrap();
